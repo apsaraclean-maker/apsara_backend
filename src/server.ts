@@ -63,7 +63,7 @@ app.get("/check-status",async(req,res)=>{
     console.log("Inside check");
     
     setTimeout(()=>{
-      fetch("http://localhost:8000/check-status")
+      fetch("https://apsara-backend-766y.onrender.com/check-status")
     },5*60*1000)
     res.json({message:"Ok"})
   } catch (error) {
