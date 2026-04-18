@@ -11,6 +11,7 @@
     "moduleDetection": "force",
     "allowJs": true,
     "noEmit": false,
+    "noEmitOnError": false,
     "strict": true,
     "esModuleInterop": true,
     "paths": {
