@@ -1,7 +1,7 @@
 {
   "compilerOptions": {
-    "target": "ES2022",
-    "module": "NodeNext",
+    "target": "esnext",
+    "module": "nodenext",
     "moduleResolution": "NodeNext",
     "outDir": "dist",
     "rootDir": ".",
@@ -19,3 +19,4 @@
   },
   "include": ["server.ts", "src/**/*.ts"]
 }
+
