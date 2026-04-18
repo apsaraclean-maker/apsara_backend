@@ -4,7 +4,7 @@
     "module": "nodenext",
     "moduleResolution": "NodeNext",
     "outDir": "dist",
-    "rootDir": ".",
+    "rootDir": "src",
     "lib": ["ES2022"],
     "skipLibCheck": true,
     "isolatedModules": true,
@@ -18,6 +18,6 @@
       "@/*": ["./*"]
     }
   },
-  "include": ["server.ts", "src/**/*.ts"]
+  "include": ["src/server.ts", "src/**/*.ts"]
 }
 
