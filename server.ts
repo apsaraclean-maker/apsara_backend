@@ -81,6 +81,8 @@ async function startServer() {
     // For now, assume user provides URI or local mongo is running.
   }
 
+  app.set('trust proxy', 1);
+
   app.use(express.json());
   app.use(cookieParser());
 
@@ -126,7 +128,7 @@ async function startServer() {
 
 
   const allowedOrigins: string[] = [
-  "https://funny-llama-333beb.netlify.app", // ❌ removed trailing slash
+  "https://funny-llama-333beb.netlify.app",
   "http://localhost:3000"
 ];
 
