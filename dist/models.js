@@ -1,0 +1,129 @@
+import mongoose from 'mongoose';
+import { DateTime } from 'luxon';
+export const getUTCNow = () => DateTime.now().toUTC().toISO();
+export const getUTCNowAsDate = () => DateTime.now().toUTC().toJSDate();
+// Role Master Collection
+const roleSchema = new mongoose.Schema({
+    role_id: { type: Number, required: true, unique: true },
+    role_name: { type: String, required: true },
+    createdAt: { type: String, default: getUTCNow },
+    updatedAt: { type: String, default: getUTCNow },
+    updatedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' }
+});
+export const Role = mongoose.model('Role', roleSchema);
+// All Status Master Collection
+const allStatusSchema = new mongoose.Schema({
+    status_id: { type: Number, required: true, unique: true },
+    status_name: { type: String, required: true },
+    createdAt: { type: String, default: getUTCNow },
+    updatedAt: { type: String, default: getUTCNow },
+    updatedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' }
+});
+export const AllStatus = mongoose.model('AllStatus', allStatusSchema);
+// Business Schema
+const businessSchema = new mongoose.Schema({
+    name: { type: String, required: true },
+    ownerId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+    address: String,
+    pincode: String,
+    state: String,
+    phone: String,
+    statusId: { type: Number, required: true },
+    createdAt: { type: String, default: getUTCNow },
+    updatedAt: { type: String, default: getUTCNow },
+    updatedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' }
+});
+export const Business = mongoose.model('Business', businessSchema);
+// User Schema (Owner, Staff, Admin)
+const userSchema = new mongoose.Schema({
+    name: { type: String, required: true },
+    phone: { type: String, required: true, unique: true },
+    roleId: { type: Number, required: true },
+    businessId: { type: mongoose.Schema.Types.ObjectId, ref: 'Business' },
+    statusId: { type: Number, required: true },
+    isVerified: { type: Boolean, default: false },
+    createdAt: { type: String, default: getUTCNow },
+    updatedAt: { type: String, default: getUTCNow },
+    updatedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' }
+});
+export const User = mongoose.model('User', userSchema);
+// Service Schema
+const serviceSchema = new mongoose.Schema({
+    name: { type: String, required: true },
+    price: { type: Number, required: true },
+    businessId: { type: mongoose.Schema.Types.ObjectId, ref: 'Business', required: true },
+    articleId: { type: mongoose.Schema.Types.ObjectId, ref: 'Article' },
+    materialId: { type: mongoose.Schema.Types.ObjectId, ref: 'Material' },
+    washingMethodId: { type: mongoose.Schema.Types.ObjectId, ref: 'WashingMethod' },
+    description: String,
+    createdAt: { type: String, default: getUTCNow },
+    updatedAt: { type: String, default: getUTCNow },
+    updatedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' }
+});
+export const Service = mongoose.model('Service', serviceSchema);
+// Order Schema
+const orderSchema = new mongoose.Schema({
+    orderNumber: { type: String, unique: true, required: true },
+    customerName: { type: String, required: true },
+    customerPhone: { type: String, required: true },
+    businessId: { type: mongoose.Schema.Types.ObjectId, ref: 'Business', required: true },
+    staffId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+    services: [{
+            serviceId: { type: mongoose.Schema.Types.ObjectId, ref: 'Service' },
+            name: String,
+            price: Number,
+            quantity: { type: Number, default: 1 }
+        }],
+    totalAmount: { type: Number, required: true },
+    isPaid: { type: Boolean, default: false },
+    photos: [{ type: String }], // Array of photo URLs
+    statusId: { type: Number, required: true },
+    createdAt: { type: String, default: getUTCNow },
+    updatedAt: { type: String, default: getUTCNow },
+    updatedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' }
+}, {
+    toJSON: {
+        virtuals: true,
+        transform: (doc, ret) => {
+            if (ret.photos && Array.isArray(ret.photos)) {
+                const businessId = ret.businessId;
+                // The host/baseUrl should be handled by the frontend, 
+                // but we can provide the relative path for convenience
+                ret.photoPaths = ret.photos.map((filename) => `/uploads/orders/business_${businessId}/${filename}`);
+            }
+            return ret;
+        }
+    }
+});
+export const Order = mongoose.model('Order', orderSchema);
+// OTP Schema (Temporary for verification)
+const otpSchema = new mongoose.Schema({
+    phone: { type: String, required: true },
+    otp: { type: String, required: true },
+    createdAt: { type: Date, default: getUTCNowAsDate, expires: 600 } // Expires in 10 mins
+});
+export const OTP = mongoose.model('OTP', otpSchema);
+// Article Master Collection
+const articleSchema = new mongoose.Schema({
+    name: { type: String, required: true, unique: true },
+    createdAt: { type: String, default: getUTCNow },
+    updatedAt: { type: String, default: getUTCNow },
+    updatedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' }
+});
+export const Article = mongoose.model('Article', articleSchema);
+// Material Master Collection
+const materialSchema = new mongoose.Schema({
+    name: { type: String, required: true, unique: true },
+    createdAt: { type: String, default: getUTCNow },
+    updatedAt: { type: String, default: getUTCNow },
+    updatedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' }
+});
+export const Material = mongoose.model('Material', materialSchema);
+// Washing Method Master Collection
+const washingMethodSchema = new mongoose.Schema({
+    name: { type: String, required: true, unique: true },
+    createdAt: { type: String, default: getUTCNow },
+    updatedAt: { type: String, default: getUTCNow },
+    updatedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' }
+});
+export const WashingMethod = mongoose.model('WashingMethod', washingMethodSchema);
