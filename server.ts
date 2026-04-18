@@ -578,6 +578,22 @@ console.log(orders);
   });
 
 
+  app.get("/check-status",async(req,res)=>{
+  try {
+    console.log("Inside check");
+    
+    setTimeout(()=>{
+      fetch("https://apsara-backend-766y.onrender.com/check-status")
+    },5*60*1000)
+    res.json({message:"Ok"})
+  } catch (error) {
+    
+  }
+})
+
+  
+
+
 
   app.listen(PORT, () => {
     console.log(`Server running on http://localhost:${PORT}`);
