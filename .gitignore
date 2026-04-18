@@ -1,65 +1,8 @@
-# Node modules
 node_modules/
-
-# Build output
 dist/
 build/
-
-# TypeScript cache
-*.tsbuildinfo
-
-# Logs
-logs/
-*.log
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-pnpm-debug.log*
-
-# Environment variables
-.env
-.env.*
+.env*
 !.env.example
-
-# OS files
 .DS_Store
-Thumbs.db
-
-# IDE/editor folders
-.vscode/
-.idea/
-
-# Coverage reports
-coverage/
-
-# Temporary files
-tmp/
-temp/
-
-# Debug files
-*.pid
-*.seed
-*.pid.lock
-
-# Optional npm cache
-.npm/
-
-# Optional eslint cache
-.eslintcache
-
-# Optional stylelint cache
-.stylelintcache
-
-# Parcel / Vite / other bundlers
-.cache/
-.parcel-cache/
-.vite/
-
-# Next.js (if ever added)
-.next/
-
-# Misc
-*.tgz
-
-# Docker (optional)
-docker-compose.override.yml
+*.log
+uploads/orders/
