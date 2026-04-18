@@ -170,10 +170,13 @@ app.use((req, res, next) => {
     cookie: {
       // maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
       httpOnly: true,
-      secure: process.env.NODE_ENV === 'production'
+      secure: process.env.NODE_ENV === 'production',
+      sameSite:"none"
     }
   }));
 
+  console.log(process.env.NODE_ENV);
+  
 
   app.post('/api/auth/register-business', async (req, res) => {
     const { businessName, ownerName, phone, address, pincode, state } = req.body;
