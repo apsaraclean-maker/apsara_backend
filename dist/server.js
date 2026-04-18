@@ -211,7 +211,7 @@ async function startServer() {
             });
             // Set session
             req.session.userId = user._id;
-            res.cookie('token', token, { httpOnly: true });
+            req.session.token = token;
             res.json({ message: 'User verified successfully', user, token });
         }
         catch (error) {
