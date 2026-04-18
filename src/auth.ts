@@ -17,7 +17,7 @@ export interface AuthRequest extends Request {
 }
 
 export const authenticateToken = (req: AuthRequest, res: Response, next: NextFunction) => {
-  const token = req.cookies.token || req.headers.authorization?.split(' ')[1];
+  const token = (req.session as any ).token || req.headers.authorization?.split(' ')[1];
 
   if (!token) {
     return res.status(401).json({ message: 'Authentication required' });
@@ -48,7 +48,7 @@ export const sessionVerification = (req: AuthRequest, res: Response, next: NextF
   }
   
   // Double check with JWT inside session or cookie
-  const token = req.cookies.token;
+  const token = (req.session as any).token;
   if (!token) {
     return res.status(401).json({ message: 'JWT token missing' });
   }

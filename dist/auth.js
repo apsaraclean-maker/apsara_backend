@@ -5,7 +5,7 @@ export const generateToken = (payload) => {
     return jwt.sign(payload, JWT_SECRET, { expiresIn: '7d' });
 };
 export const authenticateToken = (req, res, next) => {
-    const token = req.cookies.token || req.headers.authorization?.split(' ')[1];
+    const token = req.session.token || req.headers.authorization?.split(' ')[1];
     if (!token) {
         return res.status(401).json({ message: 'Authentication required' });
     }
@@ -32,7 +32,7 @@ export const sessionVerification = (req, res, next) => {
         return res.status(401).json({ message: 'Session expired or invalid' });
     }
     // Double check with JWT inside session or cookie
-    const token = req.cookies.token;
+    const token = req.session.token;
     if (!token) {
         return res.status(401).json({ message: 'JWT token missing' });
     }
