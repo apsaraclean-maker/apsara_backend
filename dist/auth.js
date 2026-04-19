@@ -1,11 +1,13 @@
 import 'dotenv/config';
 import jwt from 'jsonwebtoken';
+import { User } from './models.js';
 const JWT_SECRET = process.env.JWT_SECRET || 'fallback_secret';
 export const generateToken = (payload) => {
-    return jwt.sign(payload, JWT_SECRET, { expiresIn: '7d' });
+    return jwt.sign(payload, JWT_SECRET);
 };
 export const authenticateToken = (req, res, next) => {
     const token = req.session.token || req.headers.authorization?.split(' ')[1];
+    console.log(token, "--ytjis");
     if (!token) {
         return res.status(401).json({ message: 'Authentication required' });
     }
@@ -26,7 +28,7 @@ export const authorizeRoles = (...roles) => {
         next();
     };
 };
-export const sessionVerification = (req, res, next) => {
+export const sessionVerification = async (req, res, next) => {
     // Check if session exists in MongoDB (managed by express-session)
     if (!req.session || !req.session.userId) {
         return res.status(401).json({ message: 'Session expired or invalid' });
@@ -40,6 +42,10 @@ export const sessionVerification = (req, res, next) => {
         const decoded = jwt.verify(token, JWT_SECRET);
         if (decoded.id !== req.session.userId) {
             return res.status(401).json({ message: 'Session and Token mismatch' });
+        }
+        const user = await User.findOne({ _id: decoded.id, statusId: 1 });
+        if (!user) {
+            return res.status(401).json({ message: 'Access Denied' });
         }
         req.user = decoded;
         next();
