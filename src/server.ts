@@ -524,7 +524,7 @@ app.use((req, res, next) => {
 
   // Create Order (Owner or Staff)
   app.post('/api/orders', sessionVerification, async (req: any, res) => {
-    const { customerName, customerPhone, items, isPaid, photos } = req.body;
+    const { customerName, customerPhone, items, isPaid, photos,notes,dueDate } = req.body;
     const businessId = req.user.businessId;
     const staffId = req.user.id;
 
@@ -563,6 +563,8 @@ app.use((req, res, next) => {
         services: orderItems,
         totalAmount,
         isPaid,
+        dueDate,
+        notes,
         photos: photos || [],
         statusId: defaultStatus.status_id,
         updatedBy: req.user.id
