@@ -4,7 +4,7 @@ import mongoose from 'mongoose';
 import session from 'express-session';
 import MongoStore from 'connect-mongo';
 import cookieParser from 'cookie-parser';
-import { Business, User, Service, Order, OTP, Role, AllStatus, Article, Material, WashingMethod, getUTCNow } from './models.js';
+import { Business, User, Service, Order, OTP, Role, AllStatus, Article, Material, WashingMethod, getUTCNow, ArchivedUser } from './models.js';
 import { generateToken, authorizeRoles, sessionVerification } from './auth.js';
 import { sendWhatsAppOTP } from './whatsappService.js';
 import { DateTime } from 'luxon';
@@ -72,7 +72,7 @@ async function startServer() {
     app.use(express.json());
     app.use(cookieParser());
     // Static files for uploads
-    const uploadsDir = path.join(__dirname, 'uploads');
+    const uploadsDir = path.join(__dirname, "..", 'uploads');
     if (!fs.existsSync(uploadsDir)) {
         fs.mkdirSync(uploadsDir);
     }
@@ -139,7 +139,7 @@ async function startServer() {
             // maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
             httpOnly: true,
             secure: process.env.NODE_ENV === 'production',
-            sameSite: "none"
+            sameSite: process.env.NODE_ENV === 'production' ? "none" : "lax"
         }
     }));
     console.log(process.env.NODE_ENV);
@@ -212,9 +212,11 @@ async function startServer() {
             // Set session
             req.session.userId = user._id;
             req.session.token = token;
+            console.log("trhsi is cooke in loigin-->", req.session);
             res.json({ message: 'User verified successfully', user, token });
         }
         catch (error) {
+            console.log(error, "indside");
             res.status(500).json({ message: error.message });
         }
     });
@@ -225,6 +227,9 @@ async function startServer() {
             const user = await User.findOne({ phone });
             if (!user)
                 return res.status(404).json({ message: 'Account not found' });
+            if (user.statusId != 1) {
+                return res.status(500).json({ message: 'Access Denied' });
+            }
             // Generate OTP
             const otpCode = Math.floor(100000 + Math.random() * 900000).toString();
             await OTP.create({ phone, otp: otpCode });
@@ -236,57 +241,188 @@ async function startServer() {
             res.status(500).json({ message: error.message });
         }
     });
-    // Add Staff (Owner only)
-    app.post('/api/business/staff', sessionVerification, authorizeRoles(2), async (req, res) => {
-        const { name, phone } = req.body;
-        const businessId = req.user.businessId;
+    // Get Staff (Owner only)
+    app.get('/api/business/staff', sessionVerification, authorizeRoles(2), async (req, res) => {
         try {
-            const staffRole = await Role.findOne({ role_id: SCHEMA_CONSTANTS.ROLES.STAFF });
-            const activeStatus = await AllStatus.findOne({ status_id: SCHEMA_CONSTANTS.STATUSES.ACTIVE });
-            if (!staffRole)
-                throw new Error('Staff role not found');
-            if (!activeStatus)
-                throw new Error('Active status not found');
-            const staff = await User.create({
-                name,
-                phone,
-                roleId: staffRole.role_id,
-                statusId: activeStatus.status_id,
-                businessId,
-                isVerified: true,
-                updatedBy: req.user.id
-            });
-            res.status(201).json(staff);
+            const staff = await User.find({
+                businessId: req.user.businessId,
+                roleId: SCHEMA_CONSTANTS.ROLES.STAFF
+            }).populate('statusId');
+            res.json(staff);
         }
         catch (error) {
             res.status(500).json({ message: error.message });
         }
     });
-    // Add Service (Owner only)
-    app.post('/api/business/services', sessionVerification, async (req, res) => {
-        const { name, price, description, articleId, materialId, washingMethodId } = req.body;
+    // Add/Edit Staff OTP Request
+    app.post('/api/business/staff/request-otp', sessionVerification, authorizeRoles(2), async (req, res) => {
+        const { phone } = req.body;
+        try {
+            // If it's for edit, check if phone changed (this route is general request for any phone)
+            // Check if phone already used by someone else in the WHOLE system (since phone is unique)
+            const existing = await User.findOne({ phone });
+            // If adding new staff, existing is an error. 
+            // If editing existing staff, existing.id == staffId is fine.
+            // But we just send OTP to the phone provided.
+            const otpCode = Math.floor(100000 + Math.random() * 900000).toString();
+            await OTP.create({ phone, otp: otpCode });
+            await sendWhatsAppOTP(phone, otpCode);
+            res.json({ message: 'OTP sent to WhatsApp', phone });
+        }
+        catch (error) {
+            res.status(500).json({ message: error.message });
+        }
+    });
+    // Add or Edit Staff (after OTP)
+    app.post('/api/business/staff/verify', sessionVerification, authorizeRoles(2), async (req, res) => {
+        const { name, phone, otp, staffId } = req.body;
         const businessId = req.user.businessId;
         try {
+            const otpDoc = await OTP.findOne({ phone, otp });
+            if (!otpDoc)
+                return res.status(400).json({ message: 'Invalid or expired OTP' });
+            const staffRole = await Role.findOne({ role_id: SCHEMA_CONSTANTS.ROLES.STAFF });
+            const activeStatus = await AllStatus.findOne({ status_id: SCHEMA_CONSTANTS.STATUSES.ACTIVE });
+            if (!staffRole || !activeStatus)
+                throw new Error('Role or Status configuration missing');
+            let staff;
+            if (staffId) {
+                // Edit
+                staff = await User.findOne({ _id: staffId, businessId });
+                if (!staff)
+                    return res.status(404).json({ message: 'Staff not found' });
+                staff.name = name;
+                staff.phone = phone; // Updated phone verified via OTP
+                staff.updatedBy = req.user.id;
+                staff.updatedAt = getUTCNow();
+                await staff.save();
+            }
+            else {
+                // Add
+                const alreadyExists = await User.findOne({ phone });
+                if (alreadyExists)
+                    return res.status(400).json({ message: 'Phone already in use' });
+                staff = await User.create({
+                    name,
+                    phone,
+                    roleId: staffRole.role_id,
+                    statusId: activeStatus.status_id,
+                    businessId,
+                    isVerified: true,
+                    updatedBy: req.user.id
+                });
+            }
+            await OTP.deleteOne({ phone, otp });
+            res.json(staff);
+        }
+        catch (error) {
+            res.status(500).json({ message: error.message });
+        }
+    });
+    // Delete Staff (Archive)
+    app.delete('/api/business/staff/:id', sessionVerification, authorizeRoles(2), async (req, res) => {
+        try {
+            const staff = await User.findOne({ _id: req.params.id, businessId: req.user.businessId });
+            if (!staff)
+                return res.status(404).json({ message: 'Staff not found' });
+            // Archive
+            await ArchivedUser.create({
+                originalId: staff._id,
+                name: staff.name,
+                phone: staff.phone,
+                roleId: staff.roleId,
+                businessId: staff.businessId,
+                statusId: staff.statusId,
+                oldDetails: staff.toObject(),
+                archivedBy: req.user.id
+            });
+            // Delete from User
+            await User.deleteOne({ _id: staff._id });
+            res.json({ message: 'Staff deleted and archived successfully' });
+        }
+        catch (error) {
+            res.status(500).json({ message: error.message });
+        }
+    });
+    // Create Service (Owner only)
+    app.post('/api/business/services', sessionVerification, authorizeRoles(2), async (req, res) => {
+        const { name, price, description, articleId, materialId, washingMethodId } = req.body;
+        try {
+            const businessId = req.user.businessId;
             const service = await Service.create({
                 name,
                 price,
                 description,
-                businessId,
                 articleId,
                 materialId,
                 washingMethodId,
+                businessId,
                 updatedBy: req.user.id
             });
-            res.status(201).json(service);
+            res.json(service);
         }
         catch (error) {
             res.status(500).json({ message: error.message });
         }
     });
-    // Get Services
+    // Update Service (Owner only)
+    app.put('/api/business/services/:id', sessionVerification, authorizeRoles(2), async (req, res) => {
+        const { name, price, description, articleId, materialId, washingMethodId } = req.body;
+        try {
+            const service = await Service.findOne({ _id: req.params.id, businessId: req.user.businessId });
+            if (!service)
+                return res.status(404).json({ message: 'Service not found' });
+            // Check if service is used in active orders (status not paid)
+            const usedInActiveOrders = await Order.findOne({
+                'services.serviceId': service._id,
+                isPaid: false
+            });
+            if (usedInActiveOrders) {
+                return res.status(400).json({ message: 'Cannot edit service while it has active (unpaid) orders.' });
+            }
+            service.name = name;
+            service.price = price;
+            service.description = description;
+            service.articleId = articleId;
+            service.materialId = materialId;
+            service.washingMethodId = washingMethodId;
+            service.updatedBy = req.user.id;
+            service.updatedAt = getUTCNow();
+            await service.save();
+            res.json(service);
+        }
+        catch (error) {
+            res.status(500).json({ message: error.message });
+        }
+    });
+    // Soft Delete Service
+    app.delete('/api/business/services/:id', sessionVerification, authorizeRoles(2), async (req, res) => {
+        try {
+            const service = await Service.findOne({ _id: req.params.id, businessId: req.user.businessId });
+            if (!service)
+                return res.status(404).json({ message: 'Service not found' });
+            // Check active orders
+            const usedInActiveOrders = await Order.findOne({
+                'services.serviceId': service._id,
+                isPaid: false
+            });
+            if (usedInActiveOrders) {
+                return res.status(400).json({ message: 'Cannot delete service while it has active (unpaid) orders.' });
+            }
+            service.isDeleted = true;
+            service.updatedBy = req.user.id;
+            service.updatedAt = getUTCNow();
+            await service.save();
+            res.json({ message: 'Service deleted (marked inactive) successfully' });
+        }
+        catch (error) {
+            res.status(500).json({ message: error.message });
+        }
+    });
+    // Get Services (Updated to exclude deleted)
     app.get('/api/business/services', sessionVerification, async (req, res) => {
         try {
-            const services = await Service.find({ businessId: req.user.businessId })
+            const services = await Service.find({ businessId: req.user.businessId, isDeleted: false })
                 .populate('articleId')
                 .populate('materialId')
                 .populate('washingMethodId');
@@ -336,7 +472,7 @@ async function startServer() {
             let totalAmount = 0;
             const orderItems = [];
             for (const item of items) {
-                const service = await Service.findById(item.serviceId);
+                const service = await Service.findOne({ _id: item.serviceId, isDeleted: false });
                 if (service) {
                     orderItems.push({
                         serviceId: service._id,
@@ -370,21 +506,54 @@ async function startServer() {
             res.status(500).json({ message: error.message });
         }
     });
-    // Get Orders
+    // Get Orders with filtering and searching
     app.get('/api/orders', sessionVerification, async (req, res) => {
         try {
-            console.log(req.user);
+            const { statusId, startDate, endDate, serviceId, search } = req.query;
+            const matchCriteria = {
+                businessId: new mongoose.Types.ObjectId(req.user.businessId)
+            };
+            // Filter by Status
+            if (statusId) {
+                if (statusId === 'paid') {
+                    matchCriteria.isPaid = true;
+                }
+                else {
+                    matchCriteria.statusId = Number(statusId);
+                }
+            }
+            // Filter by Date Range
+            if (startDate || endDate) {
+                matchCriteria.createdAt = {};
+                if (startDate)
+                    matchCriteria.createdAt.$gte = startDate;
+                if (endDate)
+                    matchCriteria.createdAt.$lte = `${endDate}T23:59:59.999Z`;
+            }
+            // Filter by Service or Washing Method
+            if (serviceId) {
+                matchCriteria['services.serviceId'] = new mongoose.Types.ObjectId(serviceId);
+            }
+            if (req.query.washingMethodId) {
+                // This would require checking the service's washingMethodId
+                // In aggregation, we can use $lookup for services but it gets complex
+                // For now, let's just stick to serviceId as it's what we have in frontend list
+            }
+            // Search by Customer Name, Order Number, or Phone
+            if (search) {
+                matchCriteria.$or = [
+                    { customerName: { $regex: search, $options: 'i' } },
+                    { orderNumber: { $regex: search, $options: 'i' } },
+                    { customerPhone: { $regex: search, $options: 'i' } }
+                ];
+            }
             const orders = await Order.aggregate([
-                {
-                    $match: {
-                        businessId: new mongoose.Types.ObjectId(req.user.businessId)
-                    }
-                },
+                { $match: matchCriteria },
                 {
                     $lookup: {
-                        from: "allstatuses", // ⚠️ collection name (usually lowercase plural)
-                        localField: "statusId", // number in Order
-                        foreignField: "status_id", // number in AllStatus
+                        from: "allstatuses",
+                        localField: "statusId",
+                        foreignField: "status_id",
                         as: "statusId"
                     }
                 },
@@ -394,12 +563,27 @@ async function startServer() {
                         preserveNullAndEmptyArrays: true
                     }
                 },
-                {
-                    $sort: { createdAt: -1 }
-                }
+                { $sort: { createdAt: -1 } }
             ]);
-            console.log(orders);
             res.json(orders);
+        }
+        catch (error) {
+            res.status(500).json({ message: error.message });
+        }
+    });
+    // Get Onboarding Status
+    app.get('/api/business/onboarding-status', sessionVerification, async (req, res) => {
+        try {
+            const businessId = req.user.businessId;
+            const [serviceCount, staffCount] = await Promise.all([
+                Service.countDocuments({ businessId, isDeleted: false }),
+                User.countDocuments({ businessId, roleId: SCHEMA_CONSTANTS.ROLES.STAFF })
+            ]);
+            res.json({
+                hasServices: serviceCount > 0,
+                hasStaff: staffCount > 0,
+                isNew: serviceCount === 0 || staffCount === 0
+            });
         }
         catch (error) {
             res.status(500).json({ message: error.message });
@@ -446,58 +630,7 @@ async function startServer() {
     // Get Logged-in User Profile
     app.get('/api/auth/getuserprofile', sessionVerification, async (req, res) => {
         try {
-            const user = await User.aggregate([
-                {
-                    $match: {
-                        _id: new mongoose.Types.ObjectId(req.user.id)
-                    }
-                },
-                // BUSINESS
-                {
-                    $lookup: {
-                        from: "businesses",
-                        localField: "businessId",
-                        foreignField: "_id",
-                        as: "businessId"
-                    }
-                },
-                {
-                    $unwind: {
-                        path: "$businessId",
-                        preserveNullAndEmptyArrays: true
-                    }
-                },
-                // ROLE
-                {
-                    $lookup: {
-                        from: "roles",
-                        localField: "roleId",
-                        foreignField: "role_id",
-                        as: "roleId"
-                    }
-                },
-                {
-                    $unwind: {
-                        path: "$roleId",
-                        preserveNullAndEmptyArrays: true
-                    }
-                },
-                // STATUS
-                {
-                    $lookup: {
-                        from: "allstatuses",
-                        localField: "statusId",
-                        foreignField: "status_id",
-                        as: "statusId"
-                    }
-                },
-                {
-                    $unwind: {
-                        path: "$statusId",
-                        preserveNullAndEmptyArrays: true
-                    }
-                }
-            ]);
+            const user = await User.findOne({ _id: req.user.id, statusId: 1 });
             res.json(user);
         }
         catch (error) {

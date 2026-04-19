@@ -57,6 +57,21 @@ const userSchema = new mongoose.Schema({
 
 export const User = mongoose.model('User', userSchema);
 
+// Archived User Schema for deleted staff
+const archivedUserSchema = new mongoose.Schema({
+  originalId: { type: mongoose.Schema.Types.ObjectId, required: true },
+  name: String,
+  phone: String,
+  roleId: Number,
+  businessId: mongoose.Schema.Types.ObjectId,
+  statusId: Number,
+  oldDetails: mongoose.Schema.Types.Mixed,
+  archivedAt: { type: String, default: getUTCNow },
+  archivedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' }
+});
+
+export const ArchivedUser = mongoose.model('ArchivedUser', archivedUserSchema);
+
 // Service Schema
 const serviceSchema = new mongoose.Schema({
   name: { type: String, required: true },
@@ -66,6 +81,7 @@ const serviceSchema = new mongoose.Schema({
   materialId: { type: mongoose.Schema.Types.ObjectId, ref: 'Material' },
   washingMethodId: { type: mongoose.Schema.Types.ObjectId, ref: 'WashingMethod' },
   description: String,
+  isDeleted: { type: Boolean, default: false },
   createdAt: { type: String, default: getUTCNow },
   updatedAt: { type: String, default: getUTCNow },
   updatedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' }
