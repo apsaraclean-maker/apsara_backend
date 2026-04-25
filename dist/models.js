@@ -38,6 +38,7 @@ export const Business = mongoose.model('Business', businessSchema);
 const userSchema = new mongoose.Schema({
     name: { type: String, required: true },
     phone: { type: String, required: true, unique: true },
+    password: { type: String, required: true }, // For password login
     roleId: { type: Number, required: true },
     businessId: { type: mongoose.Schema.Types.ObjectId, ref: 'Business' },
     statusId: { type: Number, required: true },
@@ -63,10 +64,10 @@ export const ArchivedUser = mongoose.model('ArchivedUser', archivedUserSchema);
 // Service Schema
 const serviceSchema = new mongoose.Schema({
     name: { type: String, required: true },
-    price: { type: Number, required: true },
+    perUnit: { type: Number, default: 0 },
+    perKg: { type: Number, default: 0 },
     businessId: { type: mongoose.Schema.Types.ObjectId, ref: 'Business', required: true },
     articleId: { type: mongoose.Schema.Types.ObjectId, ref: 'Article' },
-    materialId: { type: mongoose.Schema.Types.ObjectId, ref: 'Material' },
     washingMethodId: { type: mongoose.Schema.Types.ObjectId, ref: 'WashingMethod' },
     description: String,
     isDeleted: { type: Boolean, default: false },
@@ -86,8 +87,11 @@ const orderSchema = new mongoose.Schema({
             serviceId: { type: mongoose.Schema.Types.ObjectId, ref: 'Service' },
             name: String,
             price: Number,
-            quantity: { type: Number, default: 1 }
+            quantity: { type: Number, default: 1 },
+            pricingType: { type: String, enum: ['unit', 'kg'], default: 'unit' }
         }],
+    extraCharge: { type: Number, default: 0 },
+    extraChargeReason: { type: String, default: '' },
     totalAmount: { type: Number, required: true },
     isPaid: { type: Boolean, default: false },
     photos: [{ type: String }], // Array of photo URLs
@@ -127,14 +131,6 @@ const articleSchema = new mongoose.Schema({
     updatedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' }
 });
 export const Article = mongoose.model('Article', articleSchema);
-// Material Master Collection
-const materialSchema = new mongoose.Schema({
-    name: { type: String, required: true, unique: true },
-    createdAt: { type: String, default: getUTCNow },
-    updatedAt: { type: String, default: getUTCNow },
-    updatedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' }
-});
-export const Material = mongoose.model('Material', materialSchema);
 // Washing Method Master Collection
 const washingMethodSchema = new mongoose.Schema({
     name: { type: String, required: true, unique: true },

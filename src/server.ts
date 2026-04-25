@@ -4,7 +4,7 @@ import mongoose from 'mongoose';
 import session from 'express-session';
 import MongoStore from 'connect-mongo';
 import cookieParser from 'cookie-parser';
-import { Business, User, Service, Order, OTP, Role, AllStatus, Article, Material, WashingMethod, getUTCNow, ArchivedUser } from './models.js';
+import { Business, User, Service, Order, OTP, Role, AllStatus, Article, WashingMethod, getUTCNow, ArchivedUser } from './models.js';
 import { generateToken, authenticateToken, authorizeRoles, sessionVerification } from './auth.js';
 import { sendWhatsAppOTP } from './whatsappService.js';
 import bcrypt from 'bcryptjs';
@@ -13,6 +13,7 @@ import multer from 'multer';
 import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
+import { sendTwilioWhatsAppOTP } from './twillio.js';
 
 
 const __filename = fileURLToPath(import.meta.url);
@@ -43,9 +44,9 @@ async function startServer() {
     }
 
     const statuses = [
-      { status_id: SCHEMA_CONSTANTS.STATUSES.ACTIVE, status_name: 'active' },
-      { status_id: SCHEMA_CONSTANTS.STATUSES.INACTIVE, status_name: 'inactive' },
-      { status_id: SCHEMA_CONSTANTS.STATUSES.BLOCKED, status_name: 'blocked' },
+      { status_id: SCHEMA_CONSTANTS.STATUSES.ACTIVE, status_name: 'user_active' },
+      { status_id: SCHEMA_CONSTANTS.STATUSES.INACTIVE, status_name: 'user_inactive' },
+      { status_id: SCHEMA_CONSTANTS.STATUSES.BLOCKED, status_name: 'user_blocked' },
       { status_id: SCHEMA_CONSTANTS.STATUSES.CREATED, status_name: 'created' },
       { status_id: SCHEMA_CONSTANTS.STATUSES.IN_PROGRESS, status_name: 'in progress' },
       { status_id: SCHEMA_CONSTANTS.STATUSES.COMPLETED, status_name: 'completed' }
@@ -54,14 +55,9 @@ async function startServer() {
       await AllStatus.findOneAndUpdate({ status_id: s.status_id }, s, { upsert: true });
     }
 
-    const articles = ['Shirt', 'T-Shirt', 'Jeans', 'Saree', 'Suit', 'Blanket', 'Curtains'];
+    const articles = ['Shirt', 'T-Shirt', 'Jeans', 'Saree', 'Suit', 'Blanket'];
     for (const name of articles) {
       await Article.findOneAndUpdate({ name }, { name }, { upsert: true });
-    }
-
-    const materials = ['Cotton', 'Silk', 'Woolen', 'Synthetic', 'Denim', 'Linen'];
-    for (const name of materials) {
-      await Material.findOneAndUpdate({ name }, { name }, { upsert: true });
     }
 
     const washMethods = ['Steam Wash', 'Wet Wash', 'Dry Clean', 'Petrol Wash', 'Ironing Only'];
@@ -171,7 +167,8 @@ app.use((req, res, next) => {
       // maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
       httpOnly: true,
       secure: process.env.NODE_ENV === 'production',
-      sameSite:process.env.NODE_ENV === 'production' ?"none":"lax"
+      sameSite:process.env.NODE_ENV === 'production' ?"none":"lax",
+      path:"/"
     }
   }));
 
@@ -179,20 +176,16 @@ app.use((req, res, next) => {
   
 
   app.post('/api/auth/register-business', async (req, res) => {
-    const { businessName, ownerName, phone, address, pincode, state } = req.body;
+    const { businessName, ownerName, phone, address, pincode, state, password } = req.body;
     
     try {
       const existingUser = await User.findOne({ phone });
       if (existingUser) return res.status(400).json({ message: 'Phone already registered' });
 
-      // Generate OTP
-      const otpCode = Math.floor(100000 + Math.random() * 900000).toString();
-      await OTP.create({ phone, otp: otpCode });
+      // Password hashing
+      const hashedPassword = await bcrypt.hash(password, 10);
 
-      // Send via real WhatsApp Service
-      await sendWhatsAppOTP(phone, otpCode);
-
-      // Create owner (unverified)
+      // Create owner (verified by default now since we're using password)
       const ownerRole = await Role.findOne({ role_id: SCHEMA_CONSTANTS.ROLES.OWNER });
       const activeStatus = await AllStatus.findOne({ status_id: SCHEMA_CONSTANTS.STATUSES.ACTIVE });
       if (!ownerRole) throw new Error('Owner role not found');
@@ -201,9 +194,10 @@ app.use((req, res, next) => {
       const user = await User.create({
         name: ownerName,
         phone,
+        password: hashedPassword,
         roleId: ownerRole.role_id,
         statusId: activeStatus.status_id,
-        isVerified: false
+        isVerified: true
       });
 
       // Create business (linked to owner)
@@ -222,7 +216,17 @@ app.use((req, res, next) => {
       user.updatedBy = user._id;
       await user.save();
 
-      res.status(201).json({ message: 'Registration initiated. Please verify OTP sent to WhatsApp.', phone });
+      // Automatically login after registration
+      const token = generateToken({ 
+        id: user._id, 
+        role: user.roleId as any, 
+        businessId: user.businessId 
+      });
+      
+      (req.session as any).userId = user._id;
+      (req.session as any).token = token;
+
+      res.status(201).json({ message: 'Business registered successfully', user, token });
     } catch (error: any) {
       res.status(500).json({ message: error.message });
     }
@@ -266,27 +270,36 @@ app.use((req, res, next) => {
     }
   });
 
-  // Login (Request OTP)
+  // Login (Password based)
   app.post('/api/auth/login', async (req, res) => {
-    const { phone } = req.body;
+    const { phone, password } = req.body;
     try {
       const user = await User.findOne({ phone });
       if (!user) return res.status(404).json({ message: 'Account not found' });
       
-      if(user.statusId!=1)
-        {
-          
-          return res.status(500).json({ message: 'Access Denied' });
+      if (user.statusId !== 1) {
+        return res.status(500).json({ message: 'Access Denied' });
       }
 
-      // Generate OTP
-      const otpCode = Math.floor(100000 + Math.random() * 900000).toString();
-      await OTP.create({ phone, otp: otpCode });
+      // If user has no password (legacy or staff created without password), they might need to set it
+      // But for now, we assume all users have passwords or we allow login if we find a match
+      if (!user.password) {
+        return res.status(400).json({ message: 'Password not set for this account. Please contact admin.' });
+      }
 
-      // Send via WhatsApp
-      await sendWhatsAppOTP(phone, otpCode);
+      const isMatch = await bcrypt.compare(password, user.password);
+      if (!isMatch) return res.status(400).json({ message: 'Invalid credentials' });
 
-      res.json({ message: 'OTP sent to WhatsApp for login', phone });
+      const token = generateToken({ 
+        id: user._id, 
+        role: user.roleId as any, 
+        businessId: user.businessId 
+      });
+      
+      (req.session as any).userId = user._id;
+      (req.session as any).token = token;
+
+      res.json({ message: 'Login successful', user, token });
     } catch (error: any) {
       res.status(500).json({ message: error.message });
     }
@@ -319,23 +332,20 @@ app.use((req, res, next) => {
       
       const otpCode = Math.floor(100000 + Math.random() * 900000).toString();
       await OTP.create({ phone, otp: otpCode });
-      await sendWhatsAppOTP(phone, otpCode);
-      
+      // await sendWhatsAppOTP(phone, otpCode);
+        // await sendTwilioWhatsAppOTP(phone,String(otpCode))
       res.json({ message: 'OTP sent to WhatsApp', phone });
     } catch (error: any) {
       res.status(500).json({ message: error.message });
     }
   });
 
-  // Add or Edit Staff (after OTP)
-  app.post('/api/business/staff/verify', sessionVerification, authorizeRoles(2), async (req: any, res) => {
-    const { name, phone, otp, staffId } = req.body;
+  // Add or Edit Staff (Password based)
+  app.post('/api/business/staff', sessionVerification, authorizeRoles(2), async (req: any, res) => {
+    const { name, phone, password, staffId } = req.body;
     const businessId = req.user.businessId;
 
     try {
-      const otpDoc = await OTP.findOne({ phone, otp });
-      if (!otpDoc) return res.status(400).json({ message: 'Invalid or expired OTP' });
-
       const staffRole = await Role.findOne({ role_id: SCHEMA_CONSTANTS.ROLES.STAFF });
       const activeStatus = await AllStatus.findOne({ status_id: SCHEMA_CONSTANTS.STATUSES.ACTIVE });
       if (!staffRole || !activeStatus) throw new Error('Role or Status configuration missing');
@@ -347,7 +357,10 @@ app.use((req, res, next) => {
         if (!staff) return res.status(404).json({ message: 'Staff not found' });
         
         staff.name = name;
-        staff.phone = phone; // Updated phone verified via OTP
+        staff.phone = phone;
+        if (password) {
+          staff.password = await bcrypt.hash(password, 10);
+        }
         staff.updatedBy = req.user.id;
         staff.updatedAt = getUTCNow();
         await staff.save();
@@ -356,9 +369,12 @@ app.use((req, res, next) => {
         const alreadyExists = await User.findOne({ phone });
         if (alreadyExists) return res.status(400).json({ message: 'Phone already in use' });
 
+        const hashedPassword = await bcrypt.hash(password, 10);
+
         staff = await User.create({
           name,
           phone,
+          password: hashedPassword,
           roleId: staffRole.role_id,
           statusId: activeStatus.status_id,
           businessId,
@@ -367,7 +383,6 @@ app.use((req, res, next) => {
         });
       }
 
-      await OTP.deleteOne({ phone, otp });
       res.json(staff);
     } catch (error: any) {
       res.status(500).json({ message: error.message });
@@ -402,15 +417,15 @@ app.use((req, res, next) => {
 
   // Create Service (Owner only)
   app.post('/api/business/services', sessionVerification, authorizeRoles(2), async (req: any, res) => {
-    const { name, price, description, articleId, materialId, washingMethodId } = req.body;
+    const { name, perUnit, perKg, description, articleId, washingMethodId } = req.body;
     try {
       const businessId = req.user.businessId;
       const service = await Service.create({
         name,
-        price,
+        perUnit: Number(perUnit) || 0,
+        perKg: Number(perKg) || 0,
         description,
         articleId,
-        materialId,
         washingMethodId,
         businessId,
         updatedBy: req.user.id
@@ -423,7 +438,7 @@ app.use((req, res, next) => {
 
   // Update Service (Owner only)
   app.put('/api/business/services/:id', sessionVerification, authorizeRoles(2), async (req: any, res) => {
-    const { name, price, description, articleId, materialId, washingMethodId } = req.body;
+    const { name, perUnit, perKg, description, articleId, washingMethodId } = req.body;
     try {
       const service = await Service.findOne({ _id: req.params.id, businessId: req.user.businessId });
       if (!service) return res.status(404).json({ message: 'Service not found' });
@@ -439,10 +454,10 @@ app.use((req, res, next) => {
       }
 
       service.name = name;
-      service.price = price;
+      service.perUnit = Number(perUnit) || 0;
+      service.perKg = Number(perKg) || 0;
       service.description = description;
       service.articleId = articleId;
-      service.materialId = materialId;
       service.washingMethodId = washingMethodId;
       service.updatedBy = req.user.id;
       service.updatedAt = getUTCNow();
@@ -486,7 +501,6 @@ app.use((req, res, next) => {
     try {
       const services = await Service.find({ businessId: req.user.businessId, isDeleted: false })
         .populate('articleId')
-        .populate('materialId')
         .populate('washingMethodId');
       res.json(services);
     } catch (error: any) {
@@ -504,15 +518,6 @@ app.use((req, res, next) => {
     }
   });
 
-  app.get('/api/master/materials', async (req, res) => {
-    try {
-      const materials = await Material.find().sort({ name: 1 });
-      res.json(materials);
-    } catch (error: any) {
-      res.status(500).json({ message: error.message });
-    }
-  });
-
   app.get('/api/master/washing-methods', async (req, res) => {
     try {
       const methods = await WashingMethod.find().sort({ name: 1 });
@@ -524,7 +529,7 @@ app.use((req, res, next) => {
 
   // Create Order (Owner or Staff)
   app.post('/api/orders', sessionVerification, async (req: any, res) => {
-    const { customerName, customerPhone, items, isPaid, photos,notes,dueDate } = req.body;
+    const { customerName, customerPhone, items, isPaid, photos, notes, dueDate, extraCharge, extraChargeReason } = req.body;
     const businessId = req.user.businessId;
     const staffId = req.user.id;
 
@@ -539,15 +544,21 @@ app.use((req, res, next) => {
       for (const item of items) {
         const service = await Service.findOne({ _id: item.serviceId, isDeleted: false });
         if (service) {
+          const pricingType = item.pricingType || 'unit';
+          const price = pricingType === 'kg' ? service.perKg : service.perUnit;
+          
           orderItems.push({
             serviceId: service._id,
             name: service.name,
-            price: service.price,
-            quantity: item.quantity
+            price: price,
+            quantity: item.quantity,
+            pricingType: pricingType
           });
-          totalAmount += service.price * item.quantity;
+          totalAmount += price * item.quantity;
         }
       }
+
+      totalAmount += (Number(extraCharge) || 0);
 
       const orderNumber = `ORD-${DateTime.now().toUTC().toMillis()}-${Math.floor(Math.random() * 1000)}`;
       
@@ -562,6 +573,8 @@ app.use((req, res, next) => {
         staffId,
         services: orderItems,
         totalAmount,
+        extraCharge: Number(extraCharge) || 0,
+        extraChargeReason: extraChargeReason || '',
         isPaid,
         dueDate,
         notes,

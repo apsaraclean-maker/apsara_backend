@@ -30,7 +30,7 @@ export const sendWhatsAppOTP = async (phone: string, otp: string) => {
       url,
       {
         messaging_product: 'whatsapp',
-        to: formattedPhone,
+        to: "91"+formattedPhone,
         type: 'template',
         template: {
           name: templateName,
