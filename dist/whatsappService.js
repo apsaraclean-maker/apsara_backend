@@ -23,7 +23,7 @@ export const sendWhatsAppOTP = async (phone, otp) => {
         // Example template structure: "Your verification code is {{1}}."
         const response = await axios.post(url, {
             messaging_product: 'whatsapp',
-            to: formattedPhone,
+            to: "91" + formattedPhone,
             type: 'template',
             template: {
                 name: templateName,
