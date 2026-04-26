@@ -110,6 +110,7 @@ const orderSchema = new mongoose.Schema({
   isPaid: { type: Boolean, default: false },
   photos: [{ type: String }], // Array of photo URLs
   statusId: { type: Number, required: true },
+  completedAt: { type: String },
   notes: { type: String },
   dueDate: { type: String },
   createdAt: { type: String, default: getUTCNow },
