@@ -13,7 +13,6 @@ import multer from 'multer';
 import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
-import { sendTwilioWhatsAppOTP } from './twillio.js';
 
 
 const __filename = fileURLToPath(import.meta.url);
@@ -23,7 +22,7 @@ const dev = process.env.NODE_ENV !== 'production';
 
 const SCHEMA_CONSTANTS = {
   ROLES: { ADMIN: 1, OWNER: 2, STAFF: 3 },
-  STATUSES: { INACTIVE: 0, ACTIVE: 1, BLOCKED: 2, CREATED: 3, IN_PROGRESS: 4, COMPLETED: 5 }
+  STATUSES: { INACTIVE: 0, ACTIVE: 1, BLOCKED: 2, CREATED: 3, IN_PROGRESS: 4, COMPLETED: 5, CANCELLED: 6 }
 };
 
 async function startServer() {
@@ -49,7 +48,8 @@ async function startServer() {
       { status_id: SCHEMA_CONSTANTS.STATUSES.BLOCKED, status_name: 'user_blocked' },
       { status_id: SCHEMA_CONSTANTS.STATUSES.CREATED, status_name: 'created' },
       { status_id: SCHEMA_CONSTANTS.STATUSES.IN_PROGRESS, status_name: 'in progress' },
-      { status_id: SCHEMA_CONSTANTS.STATUSES.COMPLETED, status_name: 'completed' }
+      { status_id: SCHEMA_CONSTANTS.STATUSES.COMPLETED, status_name: 'completed' },
+      { status_id: SCHEMA_CONSTANTS.STATUSES.CANCELLED, status_name: 'cancelled' }
     ];
     for (const s of statuses) {
       await AllStatus.findOneAndUpdate({ status_id: s.status_id }, s, { upsert: true });
@@ -333,7 +333,7 @@ app.use((req, res, next) => {
       const otpCode = Math.floor(100000 + Math.random() * 900000).toString();
       await OTP.create({ phone, otp: otpCode });
       // await sendWhatsAppOTP(phone, otpCode);
-        // await sendTwilioWhatsAppOTP(phone,String(otpCode))
+      // await sendTwilioWhatsAppOTP(phone,String(otpCode))
       res.json({ message: 'OTP sent to WhatsApp', phone });
     } catch (error: any) {
       res.status(500).json({ message: error.message });
@@ -649,6 +649,20 @@ app.use((req, res, next) => {
             preserveNullAndEmptyArrays: true
           }
         },
+        {
+          $lookup: {
+            from: "users",
+            localField: "staffId",
+            foreignField: "_id",
+            as: "staffId"
+          }
+        },
+        {
+          $unwind: {
+            path: "$staffId",
+            preserveNullAndEmptyArrays: true
+          }
+        },
         { $sort: { createdAt: -1 } }
       ]);
 
@@ -697,6 +711,9 @@ app.use((req, res, next) => {
         if(status)
         { 
           order.statusId = status.status_id;
+          if (statusName === 'completed') {
+            (order as any).completedAt = DateTime.now().toUTC().toISO();
+          }
         }
         }
       order.updatedBy=req.user.id
@@ -715,6 +732,30 @@ app.use((req, res, next) => {
       const files = req.files as Express.Multer.File[];
       const filenames = files.map(file => file.filename);
       res.json({ filenames });
+    } catch (error: any) {
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  // Cancel Order
+  app.put('/api/orders/:id/cancel', sessionVerification, async (req: any, res) => {
+    try {
+      const order = await Order.findOne({ _id: req.params.id, businessId: req.user.businessId });
+      if (!order) return res.status(404).json({ message: 'Order not found' });
+
+      if (order.isPaid) {
+        return res.status(400).json({ message: 'Cannot cancel a paid order.' });
+      }
+
+      const cancelledStatus = await AllStatus.findOne({ status_id: SCHEMA_CONSTANTS.STATUSES.CANCELLED });
+      if (!cancelledStatus) throw new Error('Cancelled status not found');
+
+      order.statusId = cancelledStatus.status_id;
+      order.updatedBy = req.user.id;
+      order.updatedAt = DateTime.now().toUTC().toISO();
+      await order.save();
+
+      res.json({ message: 'Order cancelled successfully', order });
     } catch (error: any) {
       res.status(500).json({ message: error.message });
     }
