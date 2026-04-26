@@ -17,7 +17,7 @@ const __dirname = path.dirname(__filename);
 const dev = process.env.NODE_ENV !== 'production';
 const SCHEMA_CONSTANTS = {
     ROLES: { ADMIN: 1, OWNER: 2, STAFF: 3 },
-    STATUSES: { INACTIVE: 0, ACTIVE: 1, BLOCKED: 2, CREATED: 3, IN_PROGRESS: 4, COMPLETED: 5 }
+    STATUSES: { INACTIVE: 0, ACTIVE: 1, BLOCKED: 2, CREATED: 3, IN_PROGRESS: 4, COMPLETED: 5, CANCELLED: 6 }
 };
 async function startServer() {
     const app = express();
@@ -39,7 +39,8 @@ async function startServer() {
             { status_id: SCHEMA_CONSTANTS.STATUSES.BLOCKED, status_name: 'user_blocked' },
             { status_id: SCHEMA_CONSTANTS.STATUSES.CREATED, status_name: 'created' },
             { status_id: SCHEMA_CONSTANTS.STATUSES.IN_PROGRESS, status_name: 'in progress' },
-            { status_id: SCHEMA_CONSTANTS.STATUSES.COMPLETED, status_name: 'completed' }
+            { status_id: SCHEMA_CONSTANTS.STATUSES.COMPLETED, status_name: 'completed' },
+            { status_id: SCHEMA_CONSTANTS.STATUSES.CANCELLED, status_name: 'cancelled' }
         ];
         for (const s of statuses) {
             await AllStatus.findOneAndUpdate({ status_id: s.status_id }, s, { upsert: true });
@@ -576,6 +577,20 @@ async function startServer() {
                         preserveNullAndEmptyArrays: true
                     }
                 },
+                {
+                    $lookup: {
+                        from: "users",
+                        localField: "staffId",
+                        foreignField: "_id",
+                        as: "staffId"
+                    }
+                },
+                {
+                    $unwind: {
+                        path: "$staffId",
+                        preserveNullAndEmptyArrays: true
+                    }
+                },
                 { $sort: { createdAt: -1 } }
             ]);
             res.json(orders);
@@ -616,6 +631,9 @@ async function startServer() {
                 const status = await AllStatus.findOne({ status_name: statusName });
                 if (status) {
                     order.statusId = status.status_id;
+                    if (statusName === 'completed') {
+                        order.completedAt = DateTime.now().toUTC().toISO();
+                    }
                 }
             }
             order.updatedBy = req.user.id;
@@ -633,6 +651,28 @@ async function startServer() {
             const files = req.files;
             const filenames = files.map(file => file.filename);
             res.json({ filenames });
+        }
+        catch (error) {
+            res.status(500).json({ message: error.message });
+        }
+    });
+    // Cancel Order
+    app.put('/api/orders/:id/cancel', sessionVerification, async (req, res) => {
+        try {
+            const order = await Order.findOne({ _id: req.params.id, businessId: req.user.businessId });
+            if (!order)
+                return res.status(404).json({ message: 'Order not found' });
+            if (order.isPaid) {
+                return res.status(400).json({ message: 'Cannot cancel a paid order.' });
+            }
+            const cancelledStatus = await AllStatus.findOne({ status_id: SCHEMA_CONSTANTS.STATUSES.CANCELLED });
+            if (!cancelledStatus)
+                throw new Error('Cancelled status not found');
+            order.statusId = cancelledStatus.status_id;
+            order.updatedBy = req.user.id;
+            order.updatedAt = DateTime.now().toUTC().toISO();
+            await order.save();
+            res.json({ message: 'Order cancelled successfully', order });
         }
         catch (error) {
             res.status(500).json({ message: error.message });
