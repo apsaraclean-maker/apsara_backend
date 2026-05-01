@@ -255,13 +255,30 @@ async function startServer() {
             res.status(500).json({ message: error.message });
         }
     });
+    // Get Business Profile
+    app.get('/api/business/profile', sessionVerification, async (req, res) => {
+        try {
+            const business = await Business.findById(req.user.businessId);
+            if (!business)
+                return res.status(404).json({ message: 'Business not found' });
+            res.json(business);
+        }
+        catch (error) {
+            res.status(500).json({ message: error.message });
+        }
+    });
     // Get Staff (Owner only)
     app.get('/api/business/staff', sessionVerification, authorizeRoles(2), async (req, res) => {
         try {
+            const page = parseInt(req.query.page) || 1;
+            const limit = parseInt(req.query.limit) || 100;
+            const skip = (page - 1) * limit;
             const staff = await User.find({
                 businessId: req.user.businessId,
                 roleId: SCHEMA_CONSTANTS.ROLES.STAFF
-            }).populate('statusId');
+            }).populate('statusId')
+                .skip(skip)
+                .limit(limit);
             res.json(staff);
         }
         catch (error) {
@@ -438,9 +455,14 @@ async function startServer() {
     // Get Services (Updated to exclude deleted)
     app.get('/api/business/services', sessionVerification, async (req, res) => {
         try {
+            const page = parseInt(req.query.page) || 1;
+            const limit = parseInt(req.query.limit) || 100; // Large default for services
+            const skip = (page - 1) * limit;
             const services = await Service.find({ businessId: req.user.businessId, isDeleted: false })
                 .populate('articleId')
-                .populate('washingMethodId');
+                .populate('washingMethodId')
+                .skip(skip)
+                .limit(limit);
             res.json(services);
         }
         catch (error) {
@@ -523,10 +545,17 @@ async function startServer() {
     // Get Orders with filtering and searching
     app.get('/api/orders', sessionVerification, async (req, res) => {
         try {
-            const { statusId, startDate, endDate, serviceId, search } = req.query;
+            const { statusId, startDate, endDate, serviceId, search, type } = req.query;
+            const page = parseInt(req.query.page) || 1;
+            const limit = parseInt(req.query.limit) || 10;
+            const skip = (page - 1) * limit;
             const matchCriteria = {
                 businessId: new mongoose.Types.ObjectId(req.user.businessId)
             };
+            if (type === 'active') {
+                matchCriteria.isPaid = false;
+                matchCriteria.statusId = { $nin: [SCHEMA_CONSTANTS.STATUSES.COMPLETED, SCHEMA_CONSTANTS.STATUSES.CANCELLED] };
+            }
             // Filter by Status
             if (statusId) {
                 if (statusId === 'paid') {
@@ -591,7 +620,9 @@ async function startServer() {
                         preserveNullAndEmptyArrays: true
                     }
                 },
-                { $sort: { createdAt: -1 } }
+                { $sort: { createdAt: -1 } },
+                { $skip: skip },
+                { $limit: limit }
             ]);
             res.json(orders);
         }
