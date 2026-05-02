@@ -45,11 +45,11 @@ async function startServer() {
         for (const s of statuses) {
             await AllStatus.findOneAndUpdate({ status_id: s.status_id }, s, { upsert: true });
         }
-        const articles = ['Shirt', 'T-Shirt', 'Jeans', 'Saree', 'Suit', 'Blanket'];
+        const articles = ['Shirt', 'T-Shirt', 'Jeans', 'Saree', 'Suit', 'Blanket', 'Other'];
         for (const name of articles) {
             await Article.findOneAndUpdate({ name }, { name }, { upsert: true });
         }
-        const washMethods = ['Steam Wash', 'Wet Wash', 'Dry Clean', 'Petrol Wash', 'Ironing Only'];
+        const washMethods = ['Steam Wash', 'Wet Wash', 'Dry Clean', 'Petrol Wash', 'Ironing Only', 'Other'];
         for (const name of washMethods) {
             await WashingMethod.findOneAndUpdate({ name }, { name }, { upsert: true });
         }
