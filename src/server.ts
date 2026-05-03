@@ -55,12 +55,28 @@ async function startServer() {
       await AllStatus.findOneAndUpdate({ status_id: s.status_id }, s, { upsert: true });
     }
 
-    const articles = ['Shirt', 'T-Shirt', 'Jeans', 'Saree', 'Suit', 'Blanket', 'Other'];
+    const articles = [
+      'Blouse', 'Tshirt', 'Shirt', 'Top', 'Trousers', 'Jeans', 'Dupatta',
+      'Kurta', 'Kurti', 'Anarkali Kurti', 'Salwar Suit', 'Churidar Suit',
+      'Anarkali Suit', 'Formal Skirt', 'Short Skirt', 'Western Skirt',
+      'Ethnic Skirt', 'Long Skirt', 'Dress', 'Jumpsuit', 'Gown', 'Lahenga',
+      'Waist Coat', 'Sleevless Jacket', 'Hoodie', 'Sweater', 'Jacket',
+      'Blazer', 'Coat', '2 Pcs Suit', '3 Pcs Suit', 'Sherwani', 'Dhoti',
+      'Saree', 'Saree (Light Stone Work)', 'Saree (Heavy Stone Work)', 'Shawl',
+      'Bedsheets', 'Blankets', 'Quilts', 'Curtains', 'Baby Clothes',
+      'Soft Toys', 'Pilling', 'Other'
+    ];
+    await Article.deleteMany({ name: { $nin: articles } });
     for (const name of articles) {
       await Article.findOneAndUpdate({ name }, { name }, { upsert: true });
     }
 
-    const washMethods = ['Steam Wash', 'Wet Wash', 'Dry Clean', 'Petrol Wash', 'Ironing Only', 'Other'];
+    const washMethods = [
+      'Steam Wash', 'Wet Wash', 'Petrol Wash', 'Ironing Only', 'Steam Iron',
+      'Machine Wash', 'Hand wash', 'Dry Clean', 'Machine Wash (Gentle)',
+      'Hand Wash (Gentle)', 'Premium Dry Wash', 'Dettol Wash', 'Other'
+    ];
+    await WashingMethod.deleteMany({ name: { $nin: washMethods } });
     for (const name of washMethods) {
       await WashingMethod.findOneAndUpdate({ name }, { name }, { upsert: true });
     }
