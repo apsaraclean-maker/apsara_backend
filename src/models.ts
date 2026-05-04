@@ -159,3 +159,34 @@ const washingMethodSchema = new mongoose.Schema({
   updatedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' }
 });
 export const WashingMethod = mongoose.model('WashingMethod', washingMethodSchema);
+
+// Admin User Collection (internal Apsara team)
+const adminUserSchema = new mongoose.Schema({
+  name: { type: String, required: true },
+  username: { type: String, required: true, unique: true, lowercase: true },
+  password: { type: String, required: true },
+  createdAt: { type: String, default: getUTCNow },
+  updatedAt: { type: String, default: getUTCNow }
+});
+export const AdminUser = mongoose.model('AdminUser', adminUserSchema);
+
+// Payment Collection (subscription payments from laundry businesses)
+const paymentSchema = new mongoose.Schema({
+  businessId: { type: mongoose.Schema.Types.ObjectId, ref: 'Business', required: true },
+  amount: { type: Number, required: true },
+  paymentDate: { type: String, required: true },
+  paymentMode: {
+    type: String,
+    required: true,
+    enum: ['UPI', 'Cash', 'Bank Transfer', 'NEFT', 'RTGS', 'Cheque']
+  },
+  referenceId: { type: String, default: '' },
+  bankName: { type: String, default: '' },
+  notes: { type: String, default: '' },
+  cycleStartDate: { type: String, required: true },
+  cycleEndDate: { type: String, required: true },
+  createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'AdminUser' },
+  createdAt: { type: String, default: getUTCNow },
+  updatedAt: { type: String, default: getUTCNow }
+});
+export const Payment = mongoose.model('Payment', paymentSchema);
