@@ -126,6 +126,7 @@ async function startServer() {
   const allowedOrigins: string[] = [
   "https://funny-llama-333beb.netlify.app",
   "http://localhost:3000",
+  "https://apsaraclean.com",
   "https://apsara-web.vercel.app"
 ];
 
