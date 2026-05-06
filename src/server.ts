@@ -1,4 +1,6 @@
 import 'dotenv/config';
+import dns from 'dns';
+dns.setDefaultResultOrder('ipv4first');
 import express from 'express';
 import mongoose from 'mongoose';
 import session from 'express-session';
@@ -95,7 +97,7 @@ async function startServer() {
   };
 
   try {
-    await mongoose.connect(MONGODB_URI);
+    await mongoose.connect(MONGODB_URI, { family: 4 });
     console.log('Connected to MongoDB');
     await seedData();
   } catch (err) {
@@ -154,6 +156,7 @@ async function startServer() {
   const allowedOrigins: string[] = [
   "https://funny-llama-333beb.netlify.app",
   "http://localhost:3000",
+  "http://localhost:3002",
   "https://apsara-web.vercel.app"
 ];
 
