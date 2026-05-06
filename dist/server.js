@@ -12,6 +12,12 @@ import multer from 'multer';
 import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
+import axios from 'axios';
+async function verifyRecaptcha(token) {
+    const secret = process.env.RECAPTCHA_SECRET_KEY;
+    const response = await axios.post('https://www.google.com/recaptcha/api/siteverify', null, { params: { secret, response: token } });
+    return response.data.success === true;
+}
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const dev = process.env.NODE_ENV !== 'production';
@@ -45,11 +51,27 @@ async function startServer() {
         for (const s of statuses) {
             await AllStatus.findOneAndUpdate({ status_id: s.status_id }, s, { upsert: true });
         }
-        const articles = ['Shirt', 'T-Shirt', 'Jeans', 'Saree', 'Suit', 'Blanket', 'Other'];
+        const articles = [
+            'Blouse', 'Tshirt', 'Shirt', 'Top', 'Trousers', 'Jeans', 'Dupatta',
+            'Kurta', 'Kurti', 'Anarkali Kurti', 'Salwar Suit', 'Churidar Suit',
+            'Anarkali Suit', 'Formal Skirt', 'Short Skirt', 'Western Skirt',
+            'Ethnic Skirt', 'Long Skirt', 'Dress', 'Jumpsuit', 'Gown', 'Lahenga',
+            'Waist Coat', 'Sleevless Jacket', 'Hoodie', 'Sweater', 'Jacket',
+            'Blazer', 'Coat', '2 Pcs Suit', '3 Pcs Suit', 'Sherwani', 'Dhoti',
+            'Saree', 'Saree (Light Stone Work)', 'Saree (Heavy Stone Work)', 'Shawl',
+            'Bedsheets', 'Blankets', 'Quilts', 'Curtains', 'Baby Clothes',
+            'Soft Toys', 'Pilling', 'Other'
+        ];
+        await Article.deleteMany({ name: { $nin: articles } });
         for (const name of articles) {
             await Article.findOneAndUpdate({ name }, { name }, { upsert: true });
         }
-        const washMethods = ['Steam Wash', 'Wet Wash', 'Dry Clean', 'Petrol Wash', 'Ironing Only', 'Other'];
+        const washMethods = [
+            'Steam Wash', 'Wet Wash', 'Petrol Wash', 'Ironing Only', 'Steam Iron',
+            'Machine Wash', 'Hand wash', 'Dry Clean', 'Machine Wash (Gentle)',
+            'Hand Wash (Gentle)', 'Premium Dry Wash', 'Dettol Wash', 'Other'
+        ];
+        await WashingMethod.deleteMany({ name: { $nin: washMethods } });
         for (const name of washMethods) {
             await WashingMethod.findOneAndUpdate({ name }, { name }, { upsert: true });
         }
@@ -108,6 +130,7 @@ async function startServer() {
     const allowedOrigins = [
         "https://funny-llama-333beb.netlify.app",
         "http://localhost:3000",
+        "https://apsaraclean.com",
         "https://apsara-web.vercel.app"
     ];
     app.use((req, res, next) => {
@@ -143,8 +166,13 @@ async function startServer() {
     }));
     console.log(process.env.NODE_ENV);
     app.post('/api/auth/register-business', async (req, res) => {
-        const { businessName, ownerName, phone, address, pincode, state, password } = req.body;
+        const { businessName, ownerName, phone, address, pincode, state, password, recaptchaToken } = req.body;
         try {
+            if (!recaptchaToken)
+                return res.status(400).json({ message: 'reCAPTCHA token is required' });
+            const recaptchaValid = await verifyRecaptcha(recaptchaToken);
+            if (!recaptchaValid)
+                return res.status(400).json({ message: 'reCAPTCHA verification failed' });
             const existingUser = await User.findOne({ phone });
             if (existingUser)
                 return res.status(400).json({ message: 'Phone already registered' });
@@ -227,8 +255,13 @@ async function startServer() {
     });
     // Login (Password based)
     app.post('/api/auth/login', async (req, res) => {
-        const { phone, password } = req.body;
+        const { phone, password, recaptchaToken } = req.body;
         try {
+            if (!recaptchaToken)
+                return res.status(400).json({ message: 'reCAPTCHA token is required' });
+            const recaptchaValid = await verifyRecaptcha(recaptchaToken);
+            if (!recaptchaValid)
+                return res.status(400).json({ message: 'reCAPTCHA verification failed' });
             const user = await User.findOne({ phone });
             if (!user)
                 return res.status(404).json({ message: 'Account not found' });

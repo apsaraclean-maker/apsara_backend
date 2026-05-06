@@ -15,6 +15,17 @@ import multer from 'multer';
 import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
+import axios from 'axios';
+
+async function verifyRecaptcha(token: string): Promise<boolean> {
+  const secret = process.env.RECAPTCHA_SECRET_KEY;
+  const response = await axios.post(
+    'https://www.google.com/recaptcha/api/siteverify',
+    null,
+    { params: { secret, response: token } }
+  );
+  return response.data.success === true;
+}
 
 
 const __filename = fileURLToPath(import.meta.url);
@@ -157,6 +168,7 @@ async function startServer() {
   "https://funny-llama-333beb.netlify.app",
   "http://localhost:3000",
   "http://localhost:3002",
+  "https://apsaraclean.com",
   "https://apsara-web.vercel.app"
 ];
 
@@ -208,9 +220,13 @@ app.use((req, res, next) => {
   
 
   app.post('/api/auth/register-business', async (req, res) => {
-    const { businessName, ownerName, phone, address, pincode, state, password } = req.body;
-    
+    const { businessName, ownerName, phone, address, pincode, state, password, recaptchaToken } = req.body;
+
     try {
+      if (!recaptchaToken) return res.status(400).json({ message: 'reCAPTCHA token is required' });
+      const recaptchaValid = await verifyRecaptcha(recaptchaToken);
+      if (!recaptchaValid) return res.status(400).json({ message: 'reCAPTCHA verification failed' });
+
       const existingUser = await User.findOne({ phone });
       if (existingUser) return res.status(400).json({ message: 'Phone already registered' });
 
@@ -304,8 +320,12 @@ app.use((req, res, next) => {
 
   // Login (Password based)
   app.post('/api/auth/login', async (req, res) => {
-    const { phone, password } = req.body;
+    const { phone, password, recaptchaToken } = req.body;
     try {
+      if (!recaptchaToken) return res.status(400).json({ message: 'reCAPTCHA token is required' });
+      const recaptchaValid = await verifyRecaptcha(recaptchaToken);
+      if (!recaptchaValid) return res.status(400).json({ message: 'reCAPTCHA verification failed' });
+
       const user = await User.findOne({ phone });
       if (!user) return res.status(404).json({ message: 'Account not found' });
 
