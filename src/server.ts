@@ -1,11 +1,13 @@
 import 'dotenv/config';
+import dns from 'dns';
+dns.setDefaultResultOrder('ipv4first');
 import express from 'express';
 import mongoose from 'mongoose';
 import session from 'express-session';
 import MongoStore from 'connect-mongo';
 import cookieParser from 'cookie-parser';
-import { Business, User, Service, Order, OTP, Role, AllStatus, Article, WashingMethod, getUTCNow, ArchivedUser } from './models.js';
-import { generateToken, authenticateToken, authorizeRoles, sessionVerification } from './auth.js';
+import { Business, User, Service, Order, OTP, Role, AllStatus, Article, WashingMethod, getUTCNow, ArchivedUser, AdminUser, Payment } from './models.js';
+import { generateToken, authenticateToken, authorizeRoles, sessionVerification, generateAdminToken, adminAuthMiddleware } from './auth.js';
 import { sendWhatsAppOTP } from './whatsappService.js';
 import bcrypt from 'bcryptjs';
 import { DateTime } from 'luxon';
@@ -91,10 +93,22 @@ async function startServer() {
     for (const name of washMethods) {
       await WashingMethod.findOneAndUpdate({ name }, { name }, { upsert: true });
     }
+
+    const adminUsers = [
+      { name: 'Tarun', username: 'tarun', plainPassword: 'Tarun@123' },
+      { name: 'Anshul', username: 'anshul', plainPassword: 'Anshul@123' }
+    ];
+    for (const admin of adminUsers) {
+      const existing = await AdminUser.findOne({ username: admin.username });
+      if (!existing) {
+        const hashedPassword = await bcrypt.hash(admin.plainPassword, 10);
+        await AdminUser.create({ name: admin.name, username: admin.username, password: hashedPassword });
+      }
+    }
   };
 
   try {
-    await mongoose.connect(MONGODB_URI);
+    await mongoose.connect(MONGODB_URI, { family: 4 });
     console.log('Connected to MongoDB');
     await seedData();
   } catch (err) {
@@ -153,6 +167,7 @@ async function startServer() {
   const allowedOrigins: string[] = [
   "https://funny-llama-333beb.netlify.app",
   "http://localhost:3000",
+  "http://localhost:3002",
   "https://apsaraclean.com",
   "https://apsara-web.vercel.app"
 ];
@@ -313,13 +328,16 @@ app.use((req, res, next) => {
 
       const user = await User.findOne({ phone });
       if (!user) return res.status(404).json({ message: 'Account not found' });
-      
-      if (user.statusId !== 1) {
-        return res.status(500).json({ message: 'Access Denied' });
+
+      if (user.statusId !== SCHEMA_CONSTANTS.STATUSES.ACTIVE) {
+        return res.status(403).json({ message: 'Access Denied' });
       }
 
-      // If user has no password (legacy or staff created without password), they might need to set it
-      // But for now, we assume all users have passwords or we allow login if we find a match
+      const business = await Business.findById(user.businessId);
+      if (business && business.statusId !== SCHEMA_CONSTANTS.STATUSES.ACTIVE) {
+        return res.status(403).json({ message: 'This account has been paused. To find out more please contact the Apsara support team.' });
+      }
+
       if (!user.password) {
         return res.status(400).json({ message: 'Password not set for this account. Please contact admin.' });
       }
@@ -843,6 +861,212 @@ app.use((req, res, next) => {
       res.status(500).json({ message: error.message });
     }
   });
+
+  // ─── Admin Routes ────────────────────────────────────────────────────────────
+
+  // Helper: compute current billing cycle start/end from a registration date
+  const getCurrentBillingCycle = (registrationDateStr: string): { cycleStart: string; cycleEnd: string } => {
+    const regDate = DateTime.fromISO(registrationDateStr).toUTC();
+    const regDay = regDate.day;
+    const today = DateTime.now().toUTC();
+
+    let cycleStart: DateTime;
+    if (today.day >= regDay) {
+      cycleStart = today.set({ day: regDay }).startOf('day');
+    } else {
+      cycleStart = today.minus({ months: 1 }).set({ day: regDay }).startOf('day');
+    }
+    const cycleEnd = cycleStart.plus({ months: 1 }).minus({ days: 1 }).endOf('day');
+
+    return {
+      cycleStart: cycleStart.toISODate()!,
+      cycleEnd: cycleEnd.toISODate()!
+    };
+  };
+
+  // Admin Login
+  app.post('/api/admin/login', async (req, res) => {
+    const { username, password } = req.body;
+    if (!username || !password) {
+      return res.status(400).json({ message: 'Username and password are required' });
+    }
+    try {
+      const admin = await AdminUser.findOne({ username: username.toLowerCase() });
+      if (!admin) return res.status(401).json({ message: 'Invalid credentials' });
+
+      const isMatch = await bcrypt.compare(password, admin.password);
+      if (!isMatch) return res.status(401).json({ message: 'Invalid credentials' });
+
+      const token = generateAdminToken({ id: admin._id, username: admin.username, name: admin.name });
+      res.json({ message: 'Login successful', token, admin: { id: admin._id, name: admin.name, username: admin.username } });
+    } catch (error: any) {
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  // Get all businesses with owner info and payment label
+  app.get('/api/admin/businesses', adminAuthMiddleware, async (req, res) => {
+    try {
+      const businesses = await Business.find().sort({ createdAt: -1 });
+
+      const result = await Promise.all(businesses.map(async (biz) => {
+        const owner = await User.findById(biz.ownerId).select('name phone');
+        let paymentLabel = 'N/A';
+
+        if (biz.statusId === SCHEMA_CONSTANTS.STATUSES.ACTIVE) {
+          const { cycleStart, cycleEnd } = getCurrentBillingCycle(biz.createdAt);
+          const payment = await Payment.findOne({ businessId: biz._id, cycleStartDate: cycleStart });
+          paymentLabel = payment ? 'Paid' : 'Delayed';
+        }
+
+        return {
+          _id: biz._id,
+          name: biz.name,
+          address: biz.address,
+          pincode: biz.pincode,
+          state: biz.state,
+          phone: biz.phone,
+          statusId: biz.statusId,
+          createdAt: biz.createdAt,
+          ownerName: owner?.name || '',
+          ownerPhone: owner?.phone || '',
+          paymentLabel
+        };
+      }));
+
+      res.json(result);
+    } catch (error: any) {
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  // Update business details
+  app.put('/api/admin/businesses/:id', adminAuthMiddleware, async (req, res) => {
+    const { name, address, pincode, state, phone, ownerName } = req.body;
+    try {
+      const business = await Business.findById(req.params.id);
+      if (!business) return res.status(404).json({ message: 'Business not found' });
+
+      if (name) business.name = name;
+      if (address !== undefined) business.address = address;
+      if (pincode !== undefined) business.pincode = pincode;
+      if (state !== undefined) business.state = state;
+      if (phone !== undefined) business.phone = phone;
+      business.updatedAt = getUTCNow();
+      await business.save();
+
+      if (ownerName) {
+        await User.findByIdAndUpdate(business.ownerId, { name: ownerName, updatedAt: getUTCNow() });
+      }
+
+      res.json({ message: 'Business updated successfully', business });
+    } catch (error: any) {
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  // Toggle business active / inactive
+  app.patch('/api/admin/businesses/:id/status', adminAuthMiddleware, async (req, res) => {
+    try {
+      const business = await Business.findById(req.params.id);
+      if (!business) return res.status(404).json({ message: 'Business not found' });
+
+      business.statusId = business.statusId === SCHEMA_CONSTANTS.STATUSES.ACTIVE
+        ? SCHEMA_CONSTANTS.STATUSES.INACTIVE
+        : SCHEMA_CONSTANTS.STATUSES.ACTIVE;
+      business.updatedAt = getUTCNow();
+      await business.save();
+
+      res.json({ message: `Business ${business.statusId === SCHEMA_CONSTANTS.STATUSES.ACTIVE ? 'activated' : 'deactivated'} successfully`, business });
+    } catch (error: any) {
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  // Get payment history for a business
+  app.get('/api/admin/businesses/:id/payments', adminAuthMiddleware, async (req, res) => {
+    try {
+      const business = await Business.findById(req.params.id);
+      if (!business) return res.status(404).json({ message: 'Business not found' });
+
+      const payments = await Payment.find({ businessId: req.params.id })
+        .populate('createdBy', 'name username')
+        .sort({ cycleStartDate: -1 });
+
+      const { cycleStart, cycleEnd } = getCurrentBillingCycle(business.createdAt);
+      const currentCycleHasPayment = payments.some(p => p.cycleStartDate === cycleStart);
+
+      res.json({
+        payments,
+        currentCycle: { cycleStart, cycleEnd },
+        paymentLabel: business.statusId === SCHEMA_CONSTANTS.STATUSES.ACTIVE
+          ? (currentCycleHasPayment ? 'Paid' : 'Delayed')
+          : 'N/A'
+      });
+    } catch (error: any) {
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  // Add a new payment record
+  app.post('/api/admin/businesses/:id/payments', adminAuthMiddleware, async (req: any, res) => {
+    const { amount, paymentDate, paymentMode, referenceId, bankName, notes, cycleStartDate, cycleEndDate } = req.body;
+    if (!amount || !paymentDate || !paymentMode || !cycleStartDate || !cycleEndDate) {
+      return res.status(400).json({ message: 'amount, paymentDate, paymentMode, cycleStartDate and cycleEndDate are required' });
+    }
+    try {
+      const business = await Business.findById(req.params.id);
+      if (!business) return res.status(404).json({ message: 'Business not found' });
+
+      const existing = await Payment.findOne({ businessId: req.params.id, cycleStartDate });
+      if (existing) {
+        return res.status(400).json({ message: 'A payment record already exists for this billing cycle' });
+      }
+
+      const payment = await Payment.create({
+        businessId: req.params.id,
+        amount: Number(amount),
+        paymentDate,
+        paymentMode,
+        referenceId: referenceId || '',
+        bankName: bankName || '',
+        notes: notes || '',
+        cycleStartDate,
+        cycleEndDate,
+        createdBy: req.user.id
+      });
+
+      res.status(201).json({ message: 'Payment recorded successfully', payment });
+    } catch (error: any) {
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  // Edit an existing payment record
+  app.put('/api/admin/payments/:id', adminAuthMiddleware, async (req: any, res) => {
+    const { amount, paymentDate, paymentMode, referenceId, bankName, notes, cycleStartDate, cycleEndDate } = req.body;
+    try {
+      const payment = await Payment.findById(req.params.id);
+      if (!payment) return res.status(404).json({ message: 'Payment not found' });
+
+      if (amount !== undefined) payment.amount = Number(amount);
+      if (paymentDate) payment.paymentDate = paymentDate;
+      if (paymentMode) payment.paymentMode = paymentMode;
+      if (referenceId !== undefined) payment.referenceId = referenceId;
+      if (bankName !== undefined) payment.bankName = bankName;
+      if (notes !== undefined) payment.notes = notes;
+      if (cycleStartDate) payment.cycleStartDate = cycleStartDate;
+      if (cycleEndDate) payment.cycleEndDate = cycleEndDate;
+      payment.updatedAt = getUTCNow();
+      await payment.save();
+
+      res.json({ message: 'Payment updated successfully', payment });
+    } catch (error: any) {
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────────
 
   // Logout
   app.post('/api/auth/logout', (req, res) => {

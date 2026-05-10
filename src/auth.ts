@@ -1,9 +1,10 @@
 import 'dotenv/config';
 import jwt from 'jsonwebtoken';
 import { Request, Response, NextFunction } from 'express';
-import { User } from './models.js';
+import { User, Business } from './models.js';
 
 const JWT_SECRET = process.env.JWT_SECRET || 'fallback_secret';
+const ADMIN_JWT_SECRET = process.env.ADMIN_JWT_SECRET || 'admin_fallback_secret';
 
 export const generateToken = (payload: any) => {
   return jwt.sign(payload, JWT_SECRET);
@@ -43,6 +44,22 @@ export const authorizeRoles = (...roles: number[]) => {
   };
 };
 
+export const generateAdminToken = (payload: any) => {
+  return jwt.sign(payload, ADMIN_JWT_SECRET, { expiresIn: '12h' });
+};
+
+export const adminAuthMiddleware = (req: AuthRequest, res: Response, next: NextFunction) => {
+  const token = req.headers.authorization?.split(' ')[1];
+  if (!token) return res.status(401).json({ message: 'Authentication required' });
+  try {
+    const decoded = jwt.verify(token, ADMIN_JWT_SECRET) as any;
+    req.user = decoded;
+    next();
+  } catch (error) {
+    return res.status(403).json({ message: 'Invalid or expired token' });
+  }
+};
+
 export const sessionVerification = async(req: AuthRequest, res: Response, next: NextFunction) => {
   // Check if session exists in MongoDB (managed by express-session)
   
@@ -63,12 +80,16 @@ export const sessionVerification = async(req: AuthRequest, res: Response, next: 
     }
     
     
-    const user = await User.findOne({_id:decoded.id,statusId:1})
-
-    if(!user)
-    {
+    const user = await User.findOne({ _id: decoded.id, statusId: 1 });
+    if (!user) {
       return res.status(401).json({ message: 'Access Denied' });
-      
+    }
+
+    if (user.businessId) {
+      const business = await Business.findById(user.businessId);
+      if (business && business.statusId !== 1) {
+        return res.status(403).json({ message: 'This account has been paused. To find out more please contact the Apsara support team.' });
+      }
     }
     
 
