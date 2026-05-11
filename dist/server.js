@@ -257,11 +257,9 @@ async function startServer() {
     app.post('/api/auth/login', async (req, res) => {
         const { phone, password, recaptchaToken } = req.body;
         try {
-            if (!recaptchaToken)
-                return res.status(400).json({ message: 'reCAPTCHA token is required' });
-            const recaptchaValid = await verifyRecaptcha(recaptchaToken);
-            if (!recaptchaValid)
-                return res.status(400).json({ message: 'reCAPTCHA verification failed' });
+            // if (!recaptchaToken) return res.status(400).json({ message: 'reCAPTCHA token is required' });
+            // const recaptchaValid = await verifyRecaptcha(recaptchaToken);
+            // if (!recaptchaValid) return res.status(400).json({ message: 'reCAPTCHA verification failed' });
             const user = await User.findOne({ phone });
             if (!user)
                 return res.status(404).json({ message: 'Account not found' });
@@ -439,13 +437,13 @@ async function startServer() {
             const service = await Service.findOne({ _id: req.params.id, businessId: req.user.businessId });
             if (!service)
                 return res.status(404).json({ message: 'Service not found' });
-            // Check if service is used in active orders (status not paid)
+            // Check if service is used in active orders (status not settled)
             const usedInActiveOrders = await Order.findOne({
                 'services.serviceId': service._id,
-                isPaid: false
+                isSettled: false
             });
             if (usedInActiveOrders) {
-                return res.status(400).json({ message: 'Cannot edit service while it has active (unpaid) orders.' });
+                return res.status(400).json({ message: 'Cannot edit service while it has active (unsettled) orders.' });
             }
             service.name = name;
             service.perUnit = Number(perUnit) || 0;
@@ -471,10 +469,10 @@ async function startServer() {
             // Check active orders
             const usedInActiveOrders = await Order.findOne({
                 'services.serviceId': service._id,
-                isPaid: false
+                isSettled: false
             });
             if (usedInActiveOrders) {
-                return res.status(400).json({ message: 'Cannot delete service while it has active (unpaid) orders.' });
+                return res.status(400).json({ message: 'Cannot delete service while it has active (unsettled) orders.' });
             }
             service.isDeleted = true;
             service.updatedBy = req.user.id;
@@ -490,9 +488,24 @@ async function startServer() {
     app.get('/api/business/services', sessionVerification, async (req, res) => {
         try {
             const page = parseInt(req.query.page) || 1;
-            const limit = parseInt(req.query.limit) || 100; // Large default for services
+            const limit = parseInt(req.query.limit) || 100;
             const skip = (page - 1) * limit;
-            const services = await Service.find({ businessId: req.user.businessId, isDeleted: false })
+            const search = (req.query.search || '').trim();
+            const query = { businessId: req.user.businessId, isDeleted: false };
+            if (search) {
+                const escaped = search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                const regex = { $regex: escaped, $options: 'i' };
+                const [matchedArticles, matchedMethods] = await Promise.all([
+                    Article.find({ name: regex }).select('_id'),
+                    WashingMethod.find({ name: regex }).select('_id'),
+                ]);
+                query.$or = [
+                    { name: regex },
+                    { articleId: { $in: matchedArticles.map(a => a._id) } },
+                    { washingMethodId: { $in: matchedMethods.map(m => m._id) } },
+                ];
+            }
+            const services = await Service.find(query)
                 .populate('articleId')
                 .populate('washingMethodId')
                 .skip(skip)
@@ -524,7 +537,7 @@ async function startServer() {
     });
     // Create Order (Owner or Staff)
     app.post('/api/orders', sessionVerification, async (req, res) => {
-        const { customerName, customerPhone, items, isPaid, photos, notes, dueDate, extraCharge, extraChargeReason } = req.body;
+        const { customerName, customerPhone, items, isSettled, photos, notes, dueDate, extraCharge, extraChargeReason } = req.body;
         const businessId = req.user.businessId;
         const staffId = req.user.id;
         try {
@@ -537,7 +550,8 @@ async function startServer() {
                 const service = await Service.findOne({ _id: item.serviceId, isDeleted: false });
                 if (service) {
                     const pricingType = item.pricingType || 'unit';
-                    const price = pricingType === 'kg' ? service.perKg : service.perUnit;
+                    const basePrice = pricingType === 'kg' ? service.perKg : service.perUnit;
+                    const price = (item.price != null && Number(item.price) >= 0) ? Number(item.price) : basePrice;
                     orderItems.push({
                         serviceId: service._id,
                         name: service.name,
@@ -563,7 +577,7 @@ async function startServer() {
                 totalAmount,
                 extraCharge: Number(extraCharge) || 0,
                 extraChargeReason: extraChargeReason || '',
-                isPaid,
+                isSettled,
                 dueDate,
                 notes,
                 photos: photos || [],
@@ -587,13 +601,13 @@ async function startServer() {
                 businessId: new mongoose.Types.ObjectId(req.user.businessId)
             };
             if (type === 'active') {
-                matchCriteria.isPaid = false;
+                matchCriteria.isSettled = false;
                 matchCriteria.statusId = { $nin: [SCHEMA_CONSTANTS.STATUSES.COMPLETED, SCHEMA_CONSTANTS.STATUSES.CANCELLED] };
             }
             // Filter by Status
             if (statusId) {
-                if (statusId === 'paid') {
-                    matchCriteria.isPaid = true;
+                if (statusId === 'settled') {
+                    matchCriteria.isSettled = true;
                 }
                 else {
                     matchCriteria.statusId = Number(statusId);
@@ -658,6 +672,14 @@ async function startServer() {
                 { $skip: skip },
                 { $limit: limit }
             ]);
+            // Populate serviceId inside each order's services array (with article + washing method)
+            await Order.populate(orders, {
+                path: 'services.serviceId',
+                populate: [
+                    { path: 'articleId' },
+                    { path: 'washingMethodId' }
+                ]
+            });
             res.json(orders);
         }
         catch (error) {
@@ -689,8 +711,8 @@ async function startServer() {
             const order = await Order.findOne({ _id: req.params.id, businessId: req.user.businessId });
             if (!order)
                 return res.status(404).json({ message: 'Order not found' });
-            if (statusName == "paid") {
-                order.isPaid = true;
+            if (statusName == "settled") {
+                order.isSettled = true;
             }
             else {
                 const status = await AllStatus.findOne({ status_name: statusName });
@@ -727,8 +749,8 @@ async function startServer() {
             const order = await Order.findOne({ _id: req.params.id, businessId: req.user.businessId });
             if (!order)
                 return res.status(404).json({ message: 'Order not found' });
-            if (order.isPaid) {
-                return res.status(400).json({ message: 'Cannot cancel a paid order.' });
+            if (order.isSettled) {
+                return res.status(400).json({ message: 'Cannot cancel a settled order.' });
             }
             const cancelledStatus = await AllStatus.findOne({ status_id: SCHEMA_CONSTANTS.STATUSES.CANCELLED });
             if (!cancelledStatus)
