@@ -35,7 +35,7 @@ const dev = process.env.NODE_ENV !== 'production';
 
 const SCHEMA_CONSTANTS = {
   ROLES: { ADMIN: 1, OWNER: 2, STAFF: 3 },
-  STATUSES: { INACTIVE: 0, ACTIVE: 1, BLOCKED: 2, CREATED: 3, IN_PROGRESS: 4, COMPLETED: 5, CANCELLED: 6 }
+  STATUSES: { INACTIVE: 0, ACTIVE: 1, BLOCKED: 2, CREATED: 3, UNDERWAY: 4, COMPLETED: 5, CANCELLED: 6 }
 };
 
 async function startServer() {
@@ -60,7 +60,7 @@ async function startServer() {
       { status_id: SCHEMA_CONSTANTS.STATUSES.INACTIVE, status_name: 'user_inactive' },
       { status_id: SCHEMA_CONSTANTS.STATUSES.BLOCKED, status_name: 'user_blocked' },
       { status_id: SCHEMA_CONSTANTS.STATUSES.CREATED, status_name: 'created' },
-      { status_id: SCHEMA_CONSTANTS.STATUSES.IN_PROGRESS, status_name: 'in progress' },
+      { status_id: SCHEMA_CONSTANTS.STATUSES.UNDERWAY, status_name: 'underway' },
       { status_id: SCHEMA_CONSTANTS.STATUSES.COMPLETED, status_name: 'completed' },
       { status_id: SCHEMA_CONSTANTS.STATUSES.CANCELLED, status_name: 'cancelled' }
     ];
