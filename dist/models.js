@@ -80,7 +80,7 @@ export const Service = mongoose.model('Service', serviceSchema);
 const orderSchema = new mongoose.Schema({
     orderNumber: { type: String, unique: true, required: true },
     customerName: { type: String, required: true },
-    customerPhone: { type: String, required: true },
+    customerPhone: { type: String, required: false, default: '' },
     businessId: { type: mongoose.Schema.Types.ObjectId, ref: 'Business', required: true },
     staffId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
     services: [{
@@ -93,7 +93,7 @@ const orderSchema = new mongoose.Schema({
     extraCharge: { type: Number, default: 0 },
     extraChargeReason: { type: String, default: '' },
     totalAmount: { type: Number, required: true },
-    isPaid: { type: Boolean, default: false },
+    isSettled: { type: Boolean, default: false },
     photos: [{ type: String }], // Array of photo URLs
     statusId: { type: Number, required: true },
     completedAt: { type: String },
