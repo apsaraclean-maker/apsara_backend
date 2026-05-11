@@ -257,9 +257,11 @@ async function startServer() {
     app.post('/api/auth/login', async (req, res) => {
         const { phone, password, recaptchaToken } = req.body;
         try {
-            // if (!recaptchaToken) return res.status(400).json({ message: 'reCAPTCHA token is required' });
-            // const recaptchaValid = await verifyRecaptcha(recaptchaToken);
-            // if (!recaptchaValid) return res.status(400).json({ message: 'reCAPTCHA verification failed' });
+            if (!recaptchaToken)
+                return res.status(400).json({ message: 'reCAPTCHA token is required' });
+            const recaptchaValid = await verifyRecaptcha(recaptchaToken);
+            if (!recaptchaValid)
+                return res.status(400).json({ message: 'reCAPTCHA verification failed' });
             const user = await User.findOne({ phone });
             if (!user)
                 return res.status(404).json({ message: 'Account not found' });
