@@ -40,6 +40,9 @@ const businessSchema = new mongoose.Schema({
   updatedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' }
 });
 
+businessSchema.index({ ownerId: 1 });
+businessSchema.index({ statusId: 1 });
+
 export const Business = mongoose.model('Business', businessSchema);
 
 // User Schema (Owner, Staff, Admin)
@@ -88,6 +91,8 @@ const serviceSchema = new mongoose.Schema({
   updatedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' }
 });
 
+serviceSchema.index({ businessId: 1, isDeleted: 1 });
+
 export const Service = mongoose.model('Service', serviceSchema);
 
 // Order Schema
@@ -119,7 +124,7 @@ const orderSchema = new mongoose.Schema({
 }, {
   toJSON: {
     virtuals: true,
-    transform: (doc, ret: any) => {
+    transform: (_doc, ret: any) => {
       if (ret.photos && Array.isArray(ret.photos)) {
         const businessId = ret.businessId;
         // The host/baseUrl should be handled by the frontend, 
@@ -130,6 +135,10 @@ const orderSchema = new mongoose.Schema({
     }
   }
 });
+
+orderSchema.index({ businessId: 1, createdAt: -1 });
+orderSchema.index({ businessId: 1, statusId: 1 });
+orderSchema.index({ businessId: 1, isSettled: 1 });
 
 export const Order = mongoose.model('Order', orderSchema);
 
@@ -189,4 +198,6 @@ const paymentSchema = new mongoose.Schema({
   createdAt: { type: String, default: getUTCNow },
   updatedAt: { type: String, default: getUTCNow }
 });
+paymentSchema.index({ businessId: 1, cycleStartDate: 1 });
+
 export const Payment = mongoose.model('Payment', paymentSchema);

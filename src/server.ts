@@ -7,8 +7,7 @@ import session from 'express-session';
 import MongoStore from 'connect-mongo';
 import cookieParser from 'cookie-parser';
 import { Business, User, Service, Order, OTP, Role, AllStatus, Article, WashingMethod, getUTCNow, ArchivedUser, AdminUser, Payment } from './models.js';
-import { generateToken, authenticateToken, authorizeRoles, sessionVerification, generateAdminToken, adminAuthMiddleware } from './auth.js';
-import { sendWhatsAppOTP } from './whatsappService.js';
+import { generateToken, authorizeRoles, sessionVerification, generateAdminToken, adminAuthMiddleware } from './auth.js';
 import bcrypt from 'bcryptjs';
 import { DateTime } from 'luxon';
 import multer from 'multer';
@@ -16,6 +15,7 @@ import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
 import axios from 'axios';
+import crypto from 'crypto';
 
 async function verifyRecaptcha(token: string): Promise<boolean> {
   const secret = process.env.RECAPTCHA_SECRET_KEY;
@@ -30,8 +30,6 @@ async function verifyRecaptcha(token: string): Promise<boolean> {
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-
-const dev = process.env.NODE_ENV !== 'production';
 
 const SCHEMA_CONSTANTS = {
   ROLES: { ADMIN: 1, OWNER: 2, STAFF: 3 },
@@ -143,7 +141,7 @@ async function startServer() {
       }
       cb(null, businessDir);
     },
-    filename: (req, file, cb) => {
+    filename: (_req, file, cb) => {
       const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1e9);
       cb(null, file.fieldname + '-' + uniqueSuffix + path.extname(file.originalname));
     }
@@ -152,7 +150,7 @@ async function startServer() {
   const upload = multer({
     storage,
     limits: { fileSize: 5 * 1024 * 1024 }, // 5MB limit
-    fileFilter: (req, file, cb) => {
+    fileFilter: (_req, file, cb) => {
       const allowedTypes = /jpeg|jpg|png|webp/;
       const extname = allowedTypes.test(path.extname(file.originalname).toLowerCase());
       const mimetype = allowedTypes.test(file.mimetype);
@@ -200,7 +198,7 @@ app.use((req, res, next) => {
 
   // Session Configuration
   app.use(session({
-    secret: process.env.SESSION_SECRET || 'laundry_session_secret',
+    secret: process.env.SESSION_SECRET ?? (() => { throw new Error('SESSION_SECRET environment variable must be set'); })(),
     resave: false,
     saveUninitialized: false,
     store: MongoStore.create({
@@ -215,9 +213,6 @@ app.use((req, res, next) => {
       path:"/"
     }
   }));
-
-  console.log(process.env.NODE_ENV);
-  
 
   app.post('/api/auth/register-business', async (req, res) => {
     const { businessName, ownerName, phone, address, pincode, state, password, recaptchaToken } = req.body;
@@ -307,13 +302,9 @@ app.use((req, res, next) => {
       // Set session
       (req.session as any).userId = user._id;
 
-      (req.session as any).token = token
-      console.log("trhsi is cooke in loigin-->", req.session);
-      
+      (req.session as any).token = token;
       res.json({ message: 'User verified successfully', user, token });
     } catch (error: any) {
-      console.log(error,"indside");
-      
       res.status(500).json({ message: error.message });
     }
   });
@@ -396,15 +387,8 @@ app.use((req, res, next) => {
     try {
       // If it's for edit, check if phone changed (this route is general request for any phone)
       // Check if phone already used by someone else in the WHOLE system (since phone is unique)
-      const existing = await User.findOne({ phone });
-      
-      // If adding new staff, existing is an error. 
-      // If editing existing staff, existing.id == staffId is fine.
-      // But we just send OTP to the phone provided.
-      
-      const otpCode = Math.floor(100000 + Math.random() * 900000).toString();
+      const otpCode = String(parseInt(crypto.randomBytes(3).toString('hex'), 16) % 900000 + 100000);
       await OTP.create({ phone, otp: otpCode });
-      // await sendWhatsAppOTP(phone, otpCode);
       // await sendTwilioWhatsAppOTP(phone,String(otpCode))
       res.json({ message: 'OTP sent to WhatsApp', phone });
     } catch (error: any) {
@@ -508,6 +492,9 @@ app.use((req, res, next) => {
     }
   });
 
+  const serviceHasActiveOrders = (serviceId: any) =>
+    Order.findOne({ 'services.serviceId': serviceId, isSettled: false });
+
   // Update Service (Owner only)
   app.put('/api/business/services/:id', sessionVerification, authorizeRoles(2), async (req: any, res) => {
     const { name, perUnit, perKg, description, articleId, washingMethodId } = req.body;
@@ -515,13 +502,7 @@ app.use((req, res, next) => {
       const service = await Service.findOne({ _id: req.params.id, businessId: req.user.businessId });
       if (!service) return res.status(404).json({ message: 'Service not found' });
 
-      // Check if service is used in active orders (status not settled)
-      const usedInActiveOrders = await Order.findOne({
-        'services.serviceId': service._id,
-        isSettled: false
-      });
-
-      if (usedInActiveOrders) {
+      if (await serviceHasActiveOrders(service._id)) {
         return res.status(400).json({ message: 'Cannot edit service while it has active (unsettled) orders.' });
       }
 
@@ -547,13 +528,7 @@ app.use((req, res, next) => {
       const service = await Service.findOne({ _id: req.params.id, businessId: req.user.businessId });
       if (!service) return res.status(404).json({ message: 'Service not found' });
 
-      // Check active orders
-      const usedInActiveOrders = await Order.findOne({
-        'services.serviceId': service._id,
-        isSettled: false
-      });
-
-      if (usedInActiveOrders) {
+      if (await serviceHasActiveOrders(service._id)) {
         return res.status(400).json({ message: 'Cannot delete service while it has active (unsettled) orders.' });
       }
 
@@ -603,7 +578,7 @@ app.use((req, res, next) => {
   });
 
   // Master Data Routes
-  app.get('/api/master/articles', async (req, res) => {
+  app.get('/api/master/articles', async (_req, res) => {
     try {
       const articles = await Article.find().sort({ name: 1 });
       res.json(articles);
@@ -612,7 +587,7 @@ app.use((req, res, next) => {
     }
   });
 
-  app.get('/api/master/washing-methods', async (req, res) => {
+  app.get('/api/master/washing-methods', async (_req, res) => {
     try {
       const methods = await WashingMethod.find().sort({ name: 1 });
       res.json(methods);
@@ -729,6 +704,7 @@ app.use((req, res, next) => {
 
       // Search by Customer Name, Order Number, or Phone
       if (search) {
+        if (search.length > 100) return res.status(400).json({ message: 'Search query too long' });
         matchCriteria.$or = [
           { customerName: { $regex: search, $options: 'i' } },
           { orderNumber: { $regex: search, $options: 'i' } },
@@ -931,7 +907,7 @@ app.use((req, res, next) => {
   });
 
   // Get all businesses with owner info and payment label
-  app.get('/api/admin/businesses', adminAuthMiddleware, async (req, res) => {
+  app.get('/api/admin/businesses', adminAuthMiddleware, async (_req, res) => {
     try {
       const businesses = await Business.find().sort({ createdAt: -1 });
 
@@ -940,7 +916,7 @@ app.use((req, res, next) => {
         let paymentLabel = 'N/A';
 
         if (biz.statusId === SCHEMA_CONSTANTS.STATUSES.ACTIVE) {
-          const { cycleStart, cycleEnd } = getCurrentBillingCycle(biz.createdAt);
+          const { cycleStart } = getCurrentBillingCycle(biz.createdAt);
           const payment = await Payment.findOne({ businessId: biz._id, cycleStartDate: cycleStart });
           paymentLabel = payment ? 'Paid' : 'Delayed';
         }
@@ -1104,18 +1080,12 @@ app.use((req, res, next) => {
   });
 
 
-  app.get("/check-status",async(req,res)=>{
-  try {
-    console.log("Inside check");
-    
-    setTimeout(()=>{
-      fetch("https://apsara-backend-766y.onrender.com/check-status")
-    },5*60*1000)
-    res.json({message:"Ok"})
-  } catch (error) {
-    
-  }
-})
+  app.get('/check-status', (_req, res) => {
+    setTimeout(() => {
+      fetch('https://apsara-backend-766y.onrender.com/check-status').catch(() => {});
+    }, 5 * 60 * 1000);
+    res.json({ message: 'Ok' });
+  });
 
   
 
