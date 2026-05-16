@@ -3,6 +3,7 @@ node_modules/
 build/
 .env*
 !.env.example
+!notion-sync/.env.notion.example
 .DS_Store
 *.log
 uploads/orders/

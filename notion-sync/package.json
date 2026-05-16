@@ -1,0 +1,13 @@
+{
+  "name": "apsara-notion-sync",
+  "version": "1.0.0",
+  "description": "Syncs Apsara Clean technical docs to Notion after every git commit",
+  "main": "sync-notion.js",
+  "scripts": {
+    "sync": "node sync-notion.js"
+  },
+  "dependencies": {
+    "@notionhq/client": "^2.2.15",
+    "dotenv": "^16.4.5"
+  }
+}

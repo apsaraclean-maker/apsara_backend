@@ -3,8 +3,11 @@ import jwt from 'jsonwebtoken';
 import { Request, Response, NextFunction } from 'express';
 import { User, Business } from './models.js';
 
-const JWT_SECRET = process.env.JWT_SECRET || 'fallback_secret';
-const ADMIN_JWT_SECRET = process.env.ADMIN_JWT_SECRET || 'admin_fallback_secret';
+if (!process.env.JWT_SECRET || !process.env.ADMIN_JWT_SECRET) {
+  throw new Error('JWT_SECRET and ADMIN_JWT_SECRET environment variables must be set');
+}
+const JWT_SECRET = process.env.JWT_SECRET;
+const ADMIN_JWT_SECRET = process.env.ADMIN_JWT_SECRET;
 
 export const generateToken = (payload: any) => {
   return jwt.sign(payload, JWT_SECRET);
@@ -19,8 +22,7 @@ export interface AuthRequest extends Request {
 }
 
 export const authenticateToken = (req: AuthRequest, res: Response, next: NextFunction) => {
-  const token = (req.session as any ).token || req.headers.authorization?.split(' ')[1];
-console.log(token,"--ytjis");
+  const token = (req.session as any).token || req.headers.authorization?.split(' ')[1];
 
   if (!token) {
     return res.status(401).json({ message: 'Authentication required' });
