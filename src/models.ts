@@ -4,200 +4,278 @@ import { DateTime } from 'luxon';
 export const getUTCNow = () => DateTime.now().toUTC().toISO()!;
 export const getUTCNowAsDate = () => DateTime.now().toUTC().toJSDate();
 
-// Role Master Collection
-const roleSchema = new mongoose.Schema({
-  role_id: { type: Number, required: true, unique: true },
-  role_name: { type: String, required: true },
-  createdAt: { type: String, default: getUTCNow },
-  updatedAt: { type: String, default: getUTCNow },
-  updatedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' }
-});
+export type UserRole = 'admin' | 'owner' | 'manager' | 'worker';
+export type OrderStatus = 'created' | 'in_progress' | 'completed' | 'paid' | 'cancelled';
+export type PricingMode = 'unit' | 'kg';
+export type BusinessStatus = 'active' | 'inactive' | 'blocked';
 
-export const Role = mongoose.model('Role', roleSchema);
+// ─── Business ────────────────────────────────────────────────────────────────
 
-// All Status Master Collection
-const allStatusSchema = new mongoose.Schema({
-  status_id: { type: Number, required: true, unique: true },
-  status_name: { type: String, required: true },
-  createdAt: { type: String, default: getUTCNow },
-  updatedAt: { type: String, default: getUTCNow },
-  updatedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' }
-});
-
-export const AllStatus = mongoose.model('AllStatus', allStatusSchema);
-
-// Business Schema
 const businessSchema = new mongoose.Schema({
   name: { type: String, required: true },
-  ownerId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
-  address: String,
-  pincode: String,
-  state: String,
-  phone: String,
-  statusId: { type: Number, required: true },
+  gst_number: { type: String, default: '' },
+  owner_id: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  overall_rating_cache: { type: Number, default: 0 },
+  status: { type: String, enum: ['active', 'inactive', 'blocked'], default: 'active' },
+  phone: { type: String, default: '' },
+  address: { type: String, default: '' },
+  pincode: { type: String, default: '' },
+  state: { type: String, default: '' },
   createdAt: { type: String, default: getUTCNow },
   updatedAt: { type: String, default: getUTCNow },
-  updatedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' }
 });
-
-businessSchema.index({ ownerId: 1 });
-businessSchema.index({ statusId: 1 });
-
+businessSchema.index({ owner_id: 1 });
+businessSchema.index({ status: 1 });
 export const Business = mongoose.model('Business', businessSchema);
 
-// User Schema (Owner, Staff, Admin)
+// ─── Branch ──────────────────────────────────────────────────────────────────
+
+const branchSchema = new mongoose.Schema({
+  business_id: { type: mongoose.Schema.Types.ObjectId, ref: 'Business', required: true },
+  name: { type: String, required: true },
+  branch_code: { type: String, required: true },
+  city: { type: String, default: '' },
+  state: { type: String, default: '' },
+  address: { type: String, default: '' },
+  latitude: { type: Number, default: null },
+  longitude: { type: Number, default: null },
+  deleted_at: { type: String, default: null },
+  createdAt: { type: String, default: getUTCNow },
+  updatedAt: { type: String, default: getUTCNow },
+});
+branchSchema.index({ business_id: 1, deleted_at: 1 });
+branchSchema.index({ business_id: 1, branch_code: 1 }, { unique: true });
+export const Branch = mongoose.model('Branch', branchSchema);
+
+// ─── User ─────────────────────────────────────────────────────────────────────
+
 const userSchema = new mongoose.Schema({
+  business_id: { type: mongoose.Schema.Types.ObjectId, ref: 'Business', default: null },
   name: { type: String, required: true },
   phone: { type: String, required: true, unique: true },
-  password: { type: String, required: true }, // For password login
-  roleId: { type: Number, required: true },
-  businessId: { type: mongoose.Schema.Types.ObjectId, ref: 'Business' },
-  statusId: { type: Number, required: true },
-  isVerified: { type: Boolean, default: false },
+  password_hash: { type: String, required: true },
+  pin_hash: { type: String, default: null },
+  role: { type: String, enum: ['admin', 'owner', 'manager', 'worker'], required: true },
+  employee_id: { type: String, default: null },
+  is_active: { type: Boolean, default: true },
+  failed_login_count: { type: Number, default: 0 },
+  locked_until: { type: String, default: null },
+  deleted_at: { type: String, default: null },
   createdAt: { type: String, default: getUTCNow },
   updatedAt: { type: String, default: getUTCNow },
-  updatedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' }
 });
-
+userSchema.index({ business_id: 1, role: 1 });
+userSchema.index({ phone: 1 });
 export const User = mongoose.model('User', userSchema);
 
-// Archived User Schema for deleted staff
-const archivedUserSchema = new mongoose.Schema({
-  originalId: { type: mongoose.Schema.Types.ObjectId, required: true },
-  name: String,
-  phone: String,
-  roleId: Number,
-  businessId: mongoose.Schema.Types.ObjectId,
-  statusId: Number,
-  oldDetails: mongoose.Schema.Types.Mixed,
-  archivedAt: { type: String, default: getUTCNow },
-  archivedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' }
+// ─── UserBranch (junction) ────────────────────────────────────────────────────
+
+const userBranchSchema = new mongoose.Schema({
+  user_id: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  branch_id: { type: mongoose.Schema.Types.ObjectId, ref: 'Branch', required: true },
 });
+userBranchSchema.index({ user_id: 1, branch_id: 1 }, { unique: true });
+userBranchSchema.index({ branch_id: 1 });
+export const UserBranch = mongoose.model('UserBranch', userBranchSchema);
 
-export const ArchivedUser = mongoose.model('ArchivedUser', archivedUserSchema);
+// ─── Service ──────────────────────────────────────────────────────────────────
 
-// Service Schema
 const serviceSchema = new mongoose.Schema({
+  business_id: { type: mongoose.Schema.Types.ObjectId, ref: 'Business', required: true },
   name: { type: String, required: true },
-  perUnit: { type: Number, default: 0 },
-  perKg: { type: Number, default: 0 },
-  businessId: { type: mongoose.Schema.Types.ObjectId, ref: 'Business', required: true },
-  articleId: { type: mongoose.Schema.Types.ObjectId, ref: 'Article' },
-  washingMethodId: { type: mongoose.Schema.Types.ObjectId, ref: 'WashingMethod' },
-  description: String,
-  isDeleted: { type: Boolean, default: false },
+  article_type: { type: String, default: '' },
+  washing_method: { type: String, default: '' },
+  unit_price: { type: Number, default: 0 },
+  weight_price: { type: Number, default: 0 },
+  is_active: { type: Boolean, default: true },
+  notes: { type: String, default: '' },
+  deleted_at: { type: String, default: null },
   createdAt: { type: String, default: getUTCNow },
   updatedAt: { type: String, default: getUTCNow },
-  updatedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' }
 });
-
-serviceSchema.index({ businessId: 1, isDeleted: 1 });
-
+serviceSchema.index({ business_id: 1, deleted_at: 1 });
 export const Service = mongoose.model('Service', serviceSchema);
 
-// Order Schema
+// ─── BranchService (junction) ─────────────────────────────────────────────────
+
+const branchServiceSchema = new mongoose.Schema({
+  branch_id: { type: mongoose.Schema.Types.ObjectId, ref: 'Branch', required: true },
+  service_id: { type: mongoose.Schema.Types.ObjectId, ref: 'Service', required: true },
+});
+branchServiceSchema.index({ branch_id: 1, service_id: 1 }, { unique: true });
+branchServiceSchema.index({ service_id: 1 });
+export const BranchService = mongoose.model('BranchService', branchServiceSchema);
+
+// ─── Order ────────────────────────────────────────────────────────────────────
+
 const orderSchema = new mongoose.Schema({
-  orderNumber: { type: String, unique: true, required: true },
-  customerName: { type: String, required: true },
-  customerPhone: { type: String, required: false, default: '' },
-  businessId: { type: mongoose.Schema.Types.ObjectId, ref: 'Business', required: true },
-  staffId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
-  services: [{
-    serviceId: { type: mongoose.Schema.Types.ObjectId, ref: 'Service' },
-    name: String,
-    price: Number,
-    quantity: { type: Number, default: 1 },
-    pricingType: { type: String, enum: ['unit', 'kg'], default: 'unit' }
-  }],
-  extraCharge: { type: Number, default: 0 },
-  extraChargeReason: { type: String, default: '' },
-  totalAmount: { type: Number, required: true },
-  isSettled: { type: Boolean, default: false },
-  photos: [{ type: String }], // Array of photo URLs
-  statusId: { type: Number, required: true },
-  completedAt: { type: String },
-  notes: { type: String },
-  dueDate: { type: String },
+  order_number: { type: String, unique: true, required: true },
+  business_id: { type: mongoose.Schema.Types.ObjectId, ref: 'Business', required: true },
+  branch_id: { type: mongoose.Schema.Types.ObjectId, ref: 'Branch', required: true },
+  created_by: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  customer_name: { type: String, required: true },
+  customer_mobile: { type: String, default: '' },
+  status: { type: String, enum: ['created', 'in_progress', 'completed', 'paid', 'cancelled'], default: 'created' },
+  delivery_due_date: { type: String, default: null },
+  extra_charges: { type: Number, default: 0 },
+  extra_charges_reason: { type: String, default: '' },
+  total_price: { type: Number, required: true },
+  is_delayed: { type: Boolean, default: false },
+  notes: { type: String, default: '' },
+  deleted_at: { type: String, default: null },
   createdAt: { type: String, default: getUTCNow },
   updatedAt: { type: String, default: getUTCNow },
-  updatedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' }
-}, {
-  toJSON: {
-    virtuals: true,
-    transform: (_doc, ret: any) => {
-      if (ret.photos && Array.isArray(ret.photos)) {
-        const businessId = ret.businessId;
-        // The host/baseUrl should be handled by the frontend, 
-        // but we can provide the relative path for convenience
-        ret.photoPaths = ret.photos.map((filename: string) => `/uploads/orders/business_${businessId}/${filename}`);
-      }
-      return ret;
-    }
-  }
 });
-
-orderSchema.index({ businessId: 1, createdAt: -1 });
-orderSchema.index({ businessId: 1, statusId: 1 });
-orderSchema.index({ businessId: 1, isSettled: 1 });
-
+orderSchema.index({ business_id: 1, createdAt: -1 });
+orderSchema.index({ business_id: 1, branch_id: 1, status: 1 });
+orderSchema.index({ business_id: 1, deleted_at: 1 });
 export const Order = mongoose.model('Order', orderSchema);
 
-// OTP Schema (Temporary for verification)
-const otpSchema = new mongoose.Schema({
-  phone: { type: String, required: true },
-  otp: { type: String, required: true },
-  createdAt: { type: Date, default: getUTCNowAsDate, expires: 600 } // Expires in 10 mins
+// ─── OrderService ─────────────────────────────────────────────────────────────
+
+const orderServiceSchema = new mongoose.Schema({
+  order_id: { type: mongoose.Schema.Types.ObjectId, ref: 'Order', required: true },
+  service_id: { type: mongoose.Schema.Types.ObjectId, ref: 'Service', default: null },
+  service_name_snapshot: { type: String, required: true },
+  article_type_snapshot: { type: String, default: '' },
+  washing_method_snapshot: { type: String, default: '' },
+  pricing_mode: { type: String, enum: ['unit', 'kg'], default: 'unit' },
+  quantity: { type: Number, default: 1 },
+  unit_price_snapshot: { type: Number, required: true },
+  line_total: { type: Number, required: true },
 });
+orderServiceSchema.index({ order_id: 1 });
+export const OrderService = mongoose.model('OrderService', orderServiceSchema);
 
-export const OTP = mongoose.model('OTP', otpSchema);
+// ─── OrderImage ───────────────────────────────────────────────────────────────
 
-// Article Master Collection
+const orderImageSchema = new mongoose.Schema({
+  order_id: { type: mongoose.Schema.Types.ObjectId, ref: 'Order', required: true },
+  image_url: { type: String, required: true },
+  file_size_bytes: { type: Number, default: 0 },
+  sort_order: { type: Number, default: 0 },
+  createdAt: { type: String, default: getUTCNow },
+});
+orderImageSchema.index({ order_id: 1, sort_order: 1 });
+export const OrderImage = mongoose.model('OrderImage', orderImageSchema);
+
+// ─── OrderStatusHistory ───────────────────────────────────────────────────────
+
+const orderStatusHistorySchema = new mongoose.Schema({
+  order_id: { type: mongoose.Schema.Types.ObjectId, ref: 'Order', required: true },
+  status: { type: String, required: true },
+  changed_at: { type: String, default: getUTCNow },
+  changed_by: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+});
+orderStatusHistorySchema.index({ order_id: 1, changed_at: -1 });
+export const OrderStatusHistory = mongoose.model('OrderStatusHistory', orderStatusHistorySchema);
+
+// ─── OrderRating ──────────────────────────────────────────────────────────────
+
+const orderRatingSchema = new mongoose.Schema({
+  order_id: { type: mongoose.Schema.Types.ObjectId, ref: 'Order', required: true, unique: true },
+  rating_token: { type: String, required: true, unique: true },
+  overall_rating: { type: Number, min: 1, max: 5, default: null },
+  speed_rating: { type: Number, min: 1, max: 5, default: null },
+  quality_rating: { type: Number, min: 1, max: 5, default: null },
+  submitted_at: { type: String, default: null },
+  createdAt: { type: String, default: getUTCNow },
+});
+orderRatingSchema.index({ rating_token: 1 });
+export const OrderRating = mongoose.model('OrderRating', orderRatingSchema);
+
+// ─── OrderDailyCounter ────────────────────────────────────────────────────────
+
+const orderDailyCounterSchema = new mongoose.Schema({
+  branch_id: { type: mongoose.Schema.Types.ObjectId, ref: 'Branch', required: true },
+  order_date: { type: String, required: true },
+  last_counter: { type: Number, default: 0 },
+});
+orderDailyCounterSchema.index({ branch_id: 1, order_date: 1 }, { unique: true });
+export const OrderDailyCounter = mongoose.model('OrderDailyCounter', orderDailyCounterSchema);
+
+// ─── FeatureEvent ─────────────────────────────────────────────────────────────
+
+const featureEventSchema = new mongoose.Schema({
+  business_id: { type: mongoose.Schema.Types.ObjectId, ref: 'Business', default: null },
+  user_id: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+  feature_key: { type: String, required: true },
+  metadata: { type: mongoose.Schema.Types.Mixed, default: {} },
+  createdAt: { type: String, default: getUTCNow },
+});
+featureEventSchema.index({ business_id: 1, feature_key: 1 });
+featureEventSchema.index({ createdAt: -1 });
+export const FeatureEvent = mongoose.model('FeatureEvent', featureEventSchema);
+
+// ─── Master: Article ──────────────────────────────────────────────────────────
+
 const articleSchema = new mongoose.Schema({
   name: { type: String, required: true, unique: true },
   createdAt: { type: String, default: getUTCNow },
-  updatedAt: { type: String, default: getUTCNow },
-  updatedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' }
 });
 export const Article = mongoose.model('Article', articleSchema);
 
-// Washing Method Master Collection
+// ─── Master: WashingMethod ────────────────────────────────────────────────────
+
 const washingMethodSchema = new mongoose.Schema({
   name: { type: String, required: true, unique: true },
   createdAt: { type: String, default: getUTCNow },
-  updatedAt: { type: String, default: getUTCNow },
-  updatedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' }
 });
 export const WashingMethod = mongoose.model('WashingMethod', washingMethodSchema);
 
-// Admin User Collection (internal Apsara team)
+// ─── OTP ─────────────────────────────────────────────────────────────────────
+
+const otpSchema = new mongoose.Schema({
+  phone: { type: String, required: true },
+  otp: { type: String, required: true },
+  createdAt: { type: Date, default: getUTCNowAsDate, expires: 600 },
+});
+export const OTP = mongoose.model('OTP', otpSchema);
+
+// ─── AdminUser ────────────────────────────────────────────────────────────────
+
 const adminUserSchema = new mongoose.Schema({
   name: { type: String, required: true },
   username: { type: String, required: true, unique: true, lowercase: true },
   password: { type: String, required: true },
   createdAt: { type: String, default: getUTCNow },
-  updatedAt: { type: String, default: getUTCNow }
+  updatedAt: { type: String, default: getUTCNow },
 });
 export const AdminUser = mongoose.model('AdminUser', adminUserSchema);
 
-// Payment Collection (subscription payments from laundry businesses)
+// ─── Payment ──────────────────────────────────────────────────────────────────
+
 const paymentSchema = new mongoose.Schema({
-  businessId: { type: mongoose.Schema.Types.ObjectId, ref: 'Business', required: true },
+  business_id: { type: mongoose.Schema.Types.ObjectId, ref: 'Business', required: true },
   amount: { type: Number, required: true },
-  paymentDate: { type: String, required: true },
-  paymentMode: {
+  payment_date: { type: String, required: true },
+  payment_mode: {
     type: String,
     required: true,
-    enum: ['UPI', 'Cash', 'Bank Transfer', 'NEFT', 'RTGS', 'Cheque']
+    enum: ['UPI', 'Cash', 'Bank Transfer', 'NEFT', 'RTGS', 'Cheque'],
   },
-  referenceId: { type: String, default: '' },
-  bankName: { type: String, default: '' },
+  reference_id: { type: String, default: '' },
+  bank_name: { type: String, default: '' },
   notes: { type: String, default: '' },
-  cycleStartDate: { type: String, required: true },
-  cycleEndDate: { type: String, required: true },
-  createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'AdminUser' },
+  cycle_start_date: { type: String, required: true },
+  cycle_end_date: { type: String, required: true },
+  created_by: { type: mongoose.Schema.Types.ObjectId, ref: 'AdminUser' },
   createdAt: { type: String, default: getUTCNow },
-  updatedAt: { type: String, default: getUTCNow }
+  updatedAt: { type: String, default: getUTCNow },
 });
-paymentSchema.index({ businessId: 1, cycleStartDate: 1 });
-
+paymentSchema.index({ business_id: 1, cycle_start_date: 1 });
 export const Payment = mongoose.model('Payment', paymentSchema);
+
+// ─── ArchivedUser ─────────────────────────────────────────────────────────────
+
+const archivedUserSchema = new mongoose.Schema({
+  original_id: { type: mongoose.Schema.Types.ObjectId, required: true },
+  name: String,
+  phone: String,
+  role: String,
+  business_id: mongoose.Schema.Types.ObjectId,
+  old_details: mongoose.Schema.Types.Mixed,
+  archived_at: { type: String, default: getUTCNow },
+  archived_by: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+});
+export const ArchivedUser = mongoose.model('ArchivedUser', archivedUserSchema);
