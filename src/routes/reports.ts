@@ -2,7 +2,7 @@ import { Router } from 'express';
 import { DateTime } from 'luxon';
 import mongoose from 'mongoose';
 import { Order, OrderService, Branch } from '../models.js';
-import { sessionVerification, authorizeRoles, type AuthRequest } from '../middleware/auth.js';
+import { sessionVerification, authorizeRoles, getAccessibleBranchIds, type AuthRequest } from '../middleware/auth.js';
 
 const router = Router();
 router.use(sessionVerification);
@@ -37,12 +37,21 @@ router.get('/sales', authorizeRoles('owner', 'manager'), async (req: AuthRequest
         startDt = now.startOf('month');
     }
 
+    const accessibleBranchIds = await getAccessibleBranchIds(req.user!);
+    if (accessibleBranchIds !== null && branch_id && !accessibleBranchIds.includes(branch_id as string)) {
+      return res.status(403).json({ message: 'Access to this branch is not permitted' });
+    }
+
     const match: any = {
       business_id: new mongoose.Types.ObjectId(req.user!.businessId!),
       deleted_at: null,
       createdAt: { $gte: startDt.toISO()!, $lte: endDt.toISO()! },
     };
-    if (branch_id) match.branch_id = new mongoose.Types.ObjectId(branch_id as string);
+    if (branch_id) {
+      match.branch_id = new mongoose.Types.ObjectId(branch_id as string);
+    } else if (accessibleBranchIds !== null) {
+      match.branch_id = { $in: accessibleBranchIds.map((id) => new mongoose.Types.ObjectId(id)) };
+    }
 
     const orders = await Order.find(match)
       .populate('branch_id', 'name branch_code')

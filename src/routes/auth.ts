@@ -43,6 +43,7 @@ router.post('/register-business', async (req, res) => {
       phone,
       password_hash,
       role: 'owner',
+      employee_id: 'OWN',
       is_active: true,
     });
 

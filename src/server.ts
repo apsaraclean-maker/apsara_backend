@@ -23,6 +23,7 @@ import reportRoutes from './routes/reports.js';
 import serviceRoutes from './routes/services.js';
 import staffRoutes from './routes/staff.js';
 import adminRoutes from './routes/admin.js';
+import analyticsRoutes from './routes/analytics.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -101,6 +102,7 @@ async function startServer() {
   app.use('/api/services', serviceRoutes);
   app.use('/api/staff', staffRoutes);
   app.use('/api/admin', adminRoutes);
+  app.use('/api/analytics', analyticsRoutes);
 
   // Master data
   app.get('/api/master/articles', async (_req, res) => {

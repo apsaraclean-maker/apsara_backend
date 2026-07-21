@@ -1,7 +1,7 @@
 import 'dotenv/config';
 import jwt from 'jsonwebtoken';
 import { Request, Response, NextFunction } from 'express';
-import { User, Business, type UserRole } from '../models.js';
+import { User, Business, UserBranch, type UserRole } from '../models.js';
 
 if (!process.env.JWT_SECRET || !process.env.ADMIN_JWT_SECRET) {
   throw new Error('JWT_SECRET and ADMIN_JWT_SECRET environment variables must be set');
@@ -58,6 +58,16 @@ export const sessionVerification = async (req: AuthRequest, res: Response, next:
   } catch {
     return res.status(401).json({ message: 'Invalid session token' });
   }
+};
+
+// Returns null for owners (unrestricted — all branches in the business), or the list of
+// branch IDs (as strings) a manager/worker is assigned to via UserBranch. Use this to
+// clip or reject any `branch_id` query param instead of trusting it directly — without
+// it, a manager/worker can pass another branch's ID and read its data.
+export const getAccessibleBranchIds = async (user: { id: string; role: UserRole }): Promise<string[] | null> => {
+  if (user.role === 'owner') return null;
+  const assignments = await UserBranch.find({ user_id: user.id }).select('branch_id');
+  return assignments.map((a) => String(a.branch_id));
 };
 
 export const authorizeRoles = (...roles: UserRole[]) => {

@@ -1,10 +1,30 @@
 import { Router } from 'express';
 import { DateTime } from 'luxon';
 import { Branch, BranchService, UserBranch, Service, User } from '../models.js';
-import { sessionVerification, authorizeRoles, type AuthRequest } from '../middleware/auth.js';
+import { sessionVerification, authorizeRoles, getAccessibleBranchIds, type AuthRequest } from '../middleware/auth.js';
 
 const router = Router();
 router.use(sessionVerification);
+
+// Derives a branch code from the branch name: first 3 letters, uppercased. On collision
+// with an existing code, shifts the last letter forward through the alphabet until unique
+// (e.g. DOD, DOE, DOF, ...) — per the PRD's Order Card UI calculation logic.
+function generateBranchCode(name: string, existingCodes: string[]): string {
+  const letters = name.toUpperCase().replace(/[^A-Z]/g, '');
+  const base = (letters.slice(0, 3) || 'BRN').padEnd(3, 'X');
+  const taken = new Set(existingCodes);
+
+  if (!taken.has(base)) return base;
+
+  const prefix = base.slice(0, 2);
+  let lastChar = base.charCodeAt(2);
+  for (let i = 0; i < 26; i++) {
+    lastChar = lastChar >= 90 ? 65 : lastChar + 1; // wrap Z -> A
+    const candidate = prefix + String.fromCharCode(lastChar);
+    if (!taken.has(candidate)) return candidate;
+  }
+  return base; // exhausted A-Z shifts — extremely unlikely; falls back to the unique index to reject
+}
 
 // GET /api/branches
 router.get('/', async (req: AuthRequest, res) => {
@@ -44,6 +64,11 @@ router.get('/:id', async (req: AuthRequest, res) => {
     const branch = await Branch.findOne({ _id: req.params.id, business_id: req.user!.businessId, deleted_at: null });
     if (!branch) return res.status(404).json({ message: 'Branch not found' });
 
+    const accessible = await getAccessibleBranchIds(req.user!);
+    if (accessible !== null && !accessible.includes(String(branch._id))) {
+      return res.status(403).json({ message: 'Access to this branch is not permitted' });
+    }
+
     const [services, staff] = await Promise.all([
       BranchService.find({ branch_id: branch._id }).populate('service_id'),
       UserBranch.find({ branch_id: branch._id }).populate('user_id', '-password_hash -pin_hash'),
@@ -57,12 +82,15 @@ router.get('/:id', async (req: AuthRequest, res) => {
 
 // POST /api/branches
 router.post('/', authorizeRoles('owner'), async (req: AuthRequest, res) => {
-  const { name, branch_code, city, state, address, latitude, longitude, service_ids, staff_ids } = req.body;
+  const { name, city, state, address, latitude, longitude, service_ids, staff_ids } = req.body;
   try {
+    const existing = await Branch.find({ business_id: req.user!.businessId, deleted_at: null }).select('branch_code');
+    const branch_code = generateBranchCode(name, existing.map((b) => b.branch_code));
+
     const branch = await Branch.create({
       business_id: req.user!.businessId,
       name,
-      branch_code: branch_code.toUpperCase(),
+      branch_code,
       city: city || '',
       state: state || '',
       address: address || '',
