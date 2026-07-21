@@ -86,7 +86,7 @@ router.get('/', async (req: AuthRequest, res) => {
     const {
       status, branch_id, start_date, end_date, search, is_delayed,
       service_id, min_price, max_price, created_by,
-      page = '1', limit = '20',
+      page = '1', limit = '20', sort = 'created_desc',
     } = req.query;
     const skip = (parseInt(page as string) - 1) * parseInt(limit as string);
     // PRD: Order Quickview shows a max of 200 cards.
@@ -158,11 +158,15 @@ router.get('/', async (req: AuthRequest, res) => {
 
     if (andConditions.length) match.$and = andConditions;
 
+    // Orders Grid View defaults to "latest interacted" (most recently updated) per the
+    // PRD, distinct from Order Quickview's created-date sort.
+    const sortSpec: Record<string, 1 | -1> = sort === 'updated_desc' ? { updatedAt: -1 } : { createdAt: -1 };
+
     const [orders, total] = await Promise.all([
       Order.find(match)
         .populate('branch_id', 'name branch_code')
         .populate('created_by', 'name role')
-        .sort({ createdAt: -1 })
+        .sort(sortSpec)
         .skip(skip)
         .limit(limitNum),
       Order.countDocuments(match),

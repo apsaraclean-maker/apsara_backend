@@ -30,7 +30,17 @@ router.get('/', async (req: AuthRequest, res) => {
       services = services.filter((s) => linkedIds.has(String(s._id)));
     }
 
-    res.json(services);
+    // Attach linked branches — the card shows them as tags, and the edit drawer needs
+    // them to pre-select the (mandatory) multi-select.
+    const allLinks = await BranchService.find({ service_id: { $in: services.map((s) => s._id) } }).populate('branch_id', 'name');
+    const linksByService = new Map<string, any[]>();
+    for (const link of allLinks) {
+      const key = String(link.service_id);
+      if (!linksByService.has(key)) linksByService.set(key, []);
+      linksByService.get(key)!.push(link.branch_id);
+    }
+
+    res.json(services.map((s) => ({ ...s.toObject(), branches: linksByService.get(String(s._id)) || [] })));
   } catch (err: any) {
     res.status(500).json({ message: err.message });
   }
@@ -41,7 +51,8 @@ router.get('/:id', async (req: AuthRequest, res) => {
   try {
     const service = await Service.findOne({ _id: req.params.id, business_id: req.user!.businessId, deleted_at: null });
     if (!service) return res.status(404).json({ message: 'Service not found' });
-    res.json(service);
+    const links = await BranchService.find({ service_id: service._id }).populate('branch_id', 'name');
+    res.json({ ...service.toObject(), branches: links.map((l) => l.branch_id) });
   } catch (err: any) {
     res.status(500).json({ message: err.message });
   }
@@ -49,8 +60,15 @@ router.get('/:id', async (req: AuthRequest, res) => {
 
 // POST /api/services
 router.post('/', authorizeRoles('owner'), async (req: AuthRequest, res) => {
-  const { name, article_type, washing_method, unit_price, weight_price, notes } = req.body;
+  const { name, article_type, washing_method, unit_price, weight_price, notes, branch_ids } = req.body;
   try {
+    if (!Array.isArray(branch_ids) || branch_ids.length === 0) {
+      return res.status(400).json({ message: 'Select at least one branch' });
+    }
+    if (!(Number(unit_price) > 0) && !(Number(weight_price) > 0)) {
+      return res.status(400).json({ message: 'Enter a unit price or a weight price' });
+    }
+
     const service = await Service.create({
       business_id: req.user!.businessId,
       name,
@@ -61,6 +79,9 @@ router.post('/', authorizeRoles('owner'), async (req: AuthRequest, res) => {
       notes: notes || '',
       is_active: true,
     });
+
+    await BranchService.insertMany(branch_ids.map((bid: string) => ({ branch_id: bid, service_id: service._id })));
+
     res.status(201).json(service);
   } catch (err: any) {
     res.status(500).json({ message: err.message });
@@ -69,10 +90,14 @@ router.post('/', authorizeRoles('owner'), async (req: AuthRequest, res) => {
 
 // PUT /api/services/:id
 router.put('/:id', authorizeRoles('owner'), async (req: AuthRequest, res) => {
-  const { name, article_type, washing_method, unit_price, weight_price, notes, is_active } = req.body;
+  const { name, article_type, washing_method, unit_price, weight_price, notes, branch_ids } = req.body;
   try {
     const service = await Service.findOne({ _id: req.params.id, business_id: req.user!.businessId, deleted_at: null });
     if (!service) return res.status(404).json({ message: 'Service not found' });
+
+    if (branch_ids !== undefined && (!Array.isArray(branch_ids) || branch_ids.length === 0)) {
+      return res.status(400).json({ message: 'Select at least one branch' });
+    }
 
     if (name !== undefined) service.name = name;
     if (article_type !== undefined) service.article_type = article_type;
@@ -80,10 +105,38 @@ router.put('/:id', authorizeRoles('owner'), async (req: AuthRequest, res) => {
     if (unit_price !== undefined) service.unit_price = Number(unit_price);
     if (weight_price !== undefined) service.weight_price = Number(weight_price);
     if (notes !== undefined) service.notes = notes;
-    if (is_active !== undefined) service.is_active = is_active;
     service.updatedAt = DateTime.now().toUTC().toISO()!;
     await service.save();
 
+    if (branch_ids !== undefined) {
+      await BranchService.deleteMany({ service_id: service._id });
+      await BranchService.insertMany(branch_ids.map((bid: string) => ({ branch_id: bid, service_id: service._id })));
+    }
+
+    res.json(service);
+  } catch (err: any) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// PATCH /api/services/:id/toggle — separate from the owner-only full edit above since
+// the PRD lets Manager enable/disable a service without being able to edit its details.
+router.patch('/:id/toggle', authorizeRoles('owner', 'manager'), async (req: AuthRequest, res) => {
+  const { is_active } = req.body;
+  try {
+    const service = await Service.findOne({ _id: req.params.id, business_id: req.user!.businessId, deleted_at: null });
+    if (!service) return res.status(404).json({ message: 'Service not found' });
+
+    if (is_active) {
+      const branchCount = await BranchService.countDocuments({ service_id: service._id });
+      if (branchCount === 0) {
+        return res.status(400).json({ message: 'Please link the service to at least one branch to enable' });
+      }
+    }
+
+    service.is_active = Boolean(is_active);
+    service.updatedAt = DateTime.now().toUTC().toISO()!;
+    await service.save();
     res.json(service);
   } catch (err: any) {
     res.status(500).json({ message: err.message });

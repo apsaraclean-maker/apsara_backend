@@ -149,6 +149,32 @@ router.delete('/:id', authorizeRoles('owner'), async (req: AuthRequest, res) => 
     branch.deleted_at = DateTime.now().toUTC().toISO()!;
     await branch.save();
 
+    // PRD: "the link of staff and service to this branch gets disconnected." Order
+    // deletion cascade (also specified in the PRD) is deliberately not done here — it
+    // belongs to the Business Page's delete-branch flow (Phase 7), which needs its own
+    // explicit confirmation copy given the data loss involved.
+    const affectedServiceLinks = await BranchService.find({ branch_id: branch._id }).select('service_id');
+    const affectedServiceIds = affectedServiceLinks.map((l) => l.service_id);
+    const affectedStaffLinks = await UserBranch.find({ branch_id: branch._id }).select('user_id');
+    const affectedStaffIds = affectedStaffLinks.map((l) => l.user_id);
+    await BranchService.deleteMany({ branch_id: branch._id });
+    await UserBranch.deleteMany({ branch_id: branch._id });
+
+    // Services/staff left with zero remaining branch links get disabled until re-linked
+    // (both PRD edge cases — Services Page's and Staff Page's — are the same cascade).
+    for (const serviceId of affectedServiceIds) {
+      const remaining = await BranchService.countDocuments({ service_id: serviceId });
+      if (remaining === 0) {
+        await Service.findByIdAndUpdate(serviceId, { is_active: false, updatedAt: DateTime.now().toUTC().toISO() });
+      }
+    }
+    for (const userId of affectedStaffIds) {
+      const remaining = await UserBranch.countDocuments({ user_id: userId });
+      if (remaining === 0) {
+        await User.findByIdAndUpdate(userId, { is_active: false, updatedAt: DateTime.now().toUTC().toISO() });
+      }
+    }
+
     res.json({ message: 'Branch deleted successfully' });
   } catch (err: any) {
     res.status(500).json({ message: err.message });
