@@ -10,6 +10,7 @@ import { Order, OrderService, OrderImage, OrderStatusHistory, OrderRating, Order
 import { sessionVerification, authorizeRoles, getAccessibleBranchIds } from '../middleware/auth.js';
 import { buildWhatsAppMessage } from '../services/whatsapp.js';
 import { delayedMatchCondition } from '../utils/orderDelay.js';
+import { nowInBusinessTz } from '../utils/timezone.js';
 // True if the caller (already business-scoped by whatever lookup found `order`) is also
 // allowed to touch this specific order's branch (owners are unrestricted; managers/workers
 // are limited to their UserBranch assignments). Keep the null-check on `order` as a
@@ -150,7 +151,7 @@ function isValidStatusTransition(from, to) {
 // (001-ZZZ), reset daily per branch. Matches the PRD's Order Card UI calculation logic
 // (e.g. #DOD-AP0-260612-048).
 async function getNextOrderNumber(branchId, branchCode, employeeId) {
-    const today = DateTime.now().toUTC().toFormat('yyMMdd');
+    const today = nowInBusinessTz().toFormat('yyMMdd');
     const counter = await OrderDailyCounter.findOneAndUpdate({ branch_id: branchId, order_date: today }, { $inc: { last_counter: 1 } }, { upsert: true, new: true });
     const seq = counter.last_counter.toString(36).toUpperCase().padStart(3, '0');
     return `${branchCode}-${employeeId}-${today}-${seq}`;
@@ -308,7 +309,20 @@ router.post('/', authorizeRoles('owner', 'manager'), async (req, res) => {
         const orderItems = [];
         let total_price = 0;
         for (const item of items || []) {
-            const service = await Service.findById(item.service_id);
+            // Was previously an unscoped Service.findById — no business_id check (a cross-tenant
+            // leak: any business's service_id would resolve and its details would snapshot into
+            // this order) and no is_active check (a disabled service could still be added to a
+            // brand-new order via a stale client cache or a direct API call, defeating the point
+            // of the toggle). Only applies when service_id is actually provided — ad-hoc line
+            // items with no service_id are unaffected.
+            let service = null;
+            if (item.service_id) {
+                service = await Service.findOne({ _id: item.service_id, business_id: req.user.businessId, deleted_at: null });
+                if (!service)
+                    return res.status(400).json({ message: 'One or more selected services could not be found' });
+                if (!service.is_active)
+                    return res.status(400).json({ message: `"${service.name}" is currently disabled and cannot be added to an order` });
+            }
             const unit_price = item.unit_price ?? (item.pricing_mode === 'kg' ? (service?.weight_price || 0) : (service?.unit_price || 0));
             const line_total = unit_price * (item.quantity || 1);
             total_price += line_total;
@@ -330,6 +344,7 @@ router.post('/', authorizeRoles('owner', 'manager'), async (req, res) => {
             business_id: req.user.businessId,
             branch_id,
             created_by: req.user.id,
+            created_by_name_snapshot: creator?.name || '',
             customer_name,
             customer_mobile: customer_mobile || '',
             delivery_due_date: delivery_due_date || null,
@@ -382,11 +397,32 @@ router.put('/:id', authorizeRoles('owner', 'manager'), async (req, res) => {
             order.notes = notes;
         order.updatedAt = DateTime.now().toUTC().toISO();
         if (items !== undefined) {
+            // Validate every item *before* touching existing OrderService rows — otherwise a
+            // mid-loop rejection (disabled/missing service) would leave the order with its old
+            // items already deleted and nothing to replace them.
+            //
+            // The is_active check only applies to *newly added* services, not ones the order
+            // already had — disabling a service shouldn't retroactively break editing an existing
+            // order that already used it (e.g. just changing the customer name shouldn't fail
+            // because a linked service was disabled sometime after this order was created).
+            const existingServiceIds = new Set((await OrderService.find({ order_id: order._id }).select('service_id')).map((i) => String(i.service_id)));
+            const resolvedServices = new Map();
+            for (const item of items) {
+                if (!item.service_id)
+                    continue;
+                const service = await Service.findOne({ _id: item.service_id, business_id: req.user.businessId, deleted_at: null });
+                if (!service)
+                    return res.status(400).json({ message: 'One or more selected services could not be found' });
+                if (!service.is_active && !existingServiceIds.has(String(item.service_id))) {
+                    return res.status(400).json({ message: `"${service.name}" is currently disabled and cannot be added to an order` });
+                }
+                resolvedServices.set(String(item.service_id), service);
+            }
             await OrderService.deleteMany({ order_id: order._id });
             let total_price = order.extra_charges;
             const orderItems = [];
             for (const item of items) {
-                const service = item.service_id ? await Service.findById(item.service_id) : null;
+                const service = item.service_id ? resolvedServices.get(String(item.service_id)) : null;
                 const unit_price = item.unit_price ?? (item.pricing_mode === 'kg' ? (service?.weight_price || 0) : (service?.unit_price || 0));
                 const line_total = unit_price * (item.quantity || 1);
                 total_price += line_total;

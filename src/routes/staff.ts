@@ -103,7 +103,7 @@ router.post('/', authorizeRoles('owner'), async (req: AuthRequest, res) => {
     if (!branch_ids?.length) return res.status(400).json({ message: 'Select at least one branch' });
     if (role && role !== 'manager' && role !== 'worker') return res.status(400).json({ message: 'Invalid staff type' });
 
-    const existing = await User.findOne({ phone });
+    const existing = await User.findOne({ phone, deleted_at: null });
     if (existing) return res.status(400).json({ message: 'Phone number already in use' });
 
     const password_hash = await randomUnusedPasswordHash();
@@ -173,7 +173,7 @@ router.put('/:id', authorizeRoles('owner'), async (req: AuthRequest, res) => {
 
     if (name) staff.name = name;
     if (phone && phone !== staff.phone) {
-      const conflict = await User.findOne({ phone, _id: { $ne: staff._id } });
+      const conflict = await User.findOne({ phone, deleted_at: null, _id: { $ne: staff._id } });
       if (conflict) return res.status(400).json({ message: 'Phone number already in use' });
       staff.phone = phone;
     }

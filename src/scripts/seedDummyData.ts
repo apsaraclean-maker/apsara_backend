@@ -22,6 +22,7 @@ import {
   Order, OrderService, OrderStatusHistory, OrderRating, OrderDailyCounter,
 } from '../models.js';
 import { encryptPin } from '../utils/pinCrypto.js';
+import { nowInBusinessTz } from '../utils/timezone.js';
 
 // ─── Small helpers ──────────────────────────────────────────────────────────────
 
@@ -284,7 +285,7 @@ async function seedOneBusiness(template: typeof BUSINESS_TEMPLATES[number], home
     const creator = pick(creators);
     const employeeId = creator.employee_id || 'OWN';
     const status = statusPlan[i];
-    const createdAt = DateTime.now().toUTC().minus({ days: randomInt(1, 45), hours: randomInt(0, 23) });
+    const createdAt = nowInBusinessTz().minus({ days: randomInt(1, 45), hours: randomInt(0, 23) });
 
     const isDelayed = status !== 'cancelled' && status !== 'paid' && Math.random() < 0.25;
     const dueDate = isDelayed
@@ -328,14 +329,14 @@ async function seedOneBusiness(template: typeof BUSINESS_TEMPLATES[number], home
       customer_name: `${pick(CUSTOMER_FIRST)} ${pick(CUSTOMER_LAST)} (dummy)`,
       customer_mobile: nextDummyPhone(),
       status,
-      delivery_due_date: dueDate.toISO(),
+      delivery_due_date: dueDate.toUTC().toISO(),
       extra_charges,
       extra_charges_reason: hasExtraCharge ? 'Stain removal treatment (dummy)' : '',
       total_price,
       is_delayed: isDelayed,
       notes: pick(ORDER_NOTES),
-      createdAt: createdAt.toISO()!,
-      updatedAt: createdAt.toISO()!,
+      createdAt: createdAt.toUTC().toISO()!,
+      updatedAt: createdAt.toUTC().toISO()!,
     });
 
     if (lineItems.length) await OrderService.insertMany(lineItems.map((li) => ({ ...li, order_id: order._id })));
@@ -350,11 +351,11 @@ async function seedOneBusiness(template: typeof BUSINESS_TEMPLATES[number], home
 
     let historyTime = createdAt;
     for (const stepStatus of progression) {
-      await OrderStatusHistory.create({ order_id: order._id, status: stepStatus, changed_by: creator._id, changed_at: historyTime.toISO() });
+      await OrderStatusHistory.create({ order_id: order._id, status: stepStatus, changed_by: creator._id, changed_at: historyTime.toUTC().toISO()! });
       historyTime = historyTime.plus({ hours: randomInt(2, 20) });
     }
     if (status === 'cancelled') {
-      await OrderStatusHistory.create({ order_id: order._id, status: 'cancelled', changed_by: creator._id, changed_at: historyTime.toISO() });
+      await OrderStatusHistory.create({ order_id: order._id, status: 'cancelled', changed_by: creator._id, changed_at: historyTime.toUTC().toISO()! });
     }
 
     const rating_token = crypto.randomBytes(24).toString('hex');
@@ -365,7 +366,7 @@ async function seedOneBusiness(template: typeof BUSINESS_TEMPLATES[number], home
       overall_rating: wasRated ? randomInt(3, 5) : null,
       speed_rating: wasRated ? randomInt(3, 5) : null,
       quality_rating: wasRated ? randomInt(3, 5) : null,
-      submitted_at: wasRated ? historyTime.plus({ hours: randomInt(1, 48) }).toISO() : null,
+      submitted_at: wasRated ? historyTime.plus({ hours: randomInt(1, 48) }).toUTC().toISO() : null,
     });
   }
 

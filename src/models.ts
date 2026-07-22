@@ -55,7 +55,7 @@ export const Branch = mongoose.model('Branch', branchSchema);
 const userSchema = new mongoose.Schema({
   business_id: { type: mongoose.Schema.Types.ObjectId, ref: 'Business', default: null },
   name: { type: String, required: true },
-  phone: { type: String, required: true, unique: true },
+  phone: { type: String, required: true },
   password_hash: { type: String, required: true },
   pin_encrypted: { type: String, default: null },
   role: { type: String, enum: ['admin', 'owner', 'manager', 'worker'], required: true },
@@ -68,6 +68,12 @@ const userSchema = new mongoose.Schema({
   updatedAt: { type: String, default: getUTCNow },
 });
 userSchema.index({ business_id: 1, role: 1 });
+// Phone uniqueness only applies to non-deleted accounts — a plain `unique: true` on the
+// field meant a soft-deleted user (staff removed, or a deleted business's owner) held onto
+// their phone number forever, blocking anyone else on the entire platform from ever using
+// it again until the eventual 3-month hard-delete purge. Partial index scopes the
+// uniqueness constraint to `deleted_at: null` so it frees up immediately on delete instead.
+userSchema.index({ phone: 1 }, { unique: true, partialFilterExpression: { deleted_at: null } });
 // Guards against the race condition in generateEmployeeId() (staff.ts) — two concurrent
 // "add manager" requests could otherwise both read the same existing-IDs list and compute
 // the same new employee_id before either write lands. Partial index (only documents where
@@ -124,6 +130,12 @@ const orderSchema = new mongoose.Schema({
   business_id: { type: mongoose.Schema.Types.ObjectId, ref: 'Business', required: true },
   branch_id: { type: mongoose.Schema.Types.ObjectId, ref: 'Branch', required: true },
   created_by: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  // Every other identity-bearing field on an order (service name, article type, washing
+  // method) is deliberately snapshotted so historical orders stay meaningful even after the
+  // source record changes — created_by wasn't, so an order created by a staff member who's
+  // since been hard-deleted (post 3-month purge) would silently lose "who created this"
+  // entirely once populate('created_by') resolves to null.
+  created_by_name_snapshot: { type: String, default: '' },
   customer_name: { type: String, required: true },
   customer_mobile: { type: String, default: '' },
   status: { type: String, enum: ['created', 'in_progress', 'completed', 'paid', 'cancelled'], default: 'created' },
@@ -241,6 +253,21 @@ const otpSchema = new mongoose.Schema({
   createdAt: { type: Date, default: getUTCNowAsDate, expires: 600 },
 });
 export const OTP = mongoose.model('OTP', otpSchema);
+
+// ─── ActiveSession ────────────────────────────────────────────────────────────
+// Tracks each logged-in session per user so login can enforce a device-count limit and
+// show the caller which devices are currently active. TTL matches the session cookie's
+// fixed 7-day maxAge (server.ts) — not a sliding expiry, since the cookie itself isn't one.
+
+const activeSessionSchema = new mongoose.Schema({
+  user_id: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  session_id: { type: String, required: true, unique: true },
+  device_label: { type: String, default: 'Unknown device' },
+  ip_address: { type: String, default: '' },
+  createdAt: { type: Date, default: getUTCNowAsDate, expires: 7 * 24 * 60 * 60 },
+});
+activeSessionSchema.index({ user_id: 1 });
+export const ActiveSession = mongoose.model('ActiveSession', activeSessionSchema);
 
 // ─── AdminUser ────────────────────────────────────────────────────────────────
 

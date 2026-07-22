@@ -2,26 +2,33 @@ import { Router } from 'express';
 import { DateTime } from 'luxon';
 import { Branch, BranchService, UserBranch, Service, User, Order } from '../models.js';
 import { sessionVerification, authorizeRoles, getAccessibleBranchIds } from '../middleware/auth.js';
+import { nowInBusinessTz } from '../utils/timezone.js';
 const router = Router();
 router.use(sessionVerification);
-// Derives a branch code from the branch name: first 3 letters, uppercased. On collision
-// with an existing code, shifts the last letter forward through the alphabet until unique
-// (e.g. DOD, DOE, DOF, ...) — per the PRD's Order Card UI calculation logic.
-function generateBranchCode(name, existingCodes) {
+// Derives a branch code from the branch name: first 3 letters, uppercased. Per the PRD:
+// "In case the code already exists, then the 1st letter is skipped for creating the code" —
+// i.e. on conflict, skip the first letter and take the *next* 3 letters from the start of
+// the name (not the previous shift-the-last-letter-through-the-alphabet scheme this used to
+// implement). Repeated conflicts keep skipping one further letter each time.
+export function generateBranchCode(name, existingCodes) {
     const letters = name.toUpperCase().replace(/[^A-Z]/g, '');
-    const base = (letters.slice(0, 3) || 'BRN').padEnd(3, 'X');
     const taken = new Set(existingCodes);
-    if (!taken.has(base))
-        return base;
-    const prefix = base.slice(0, 2);
-    let lastChar = base.charCodeAt(2);
-    for (let i = 0; i < 26; i++) {
-        lastChar = lastChar >= 90 ? 65 : lastChar + 1; // wrap Z -> A
-        const candidate = prefix + String.fromCharCode(lastChar);
+    const maxSkip = Math.max(letters.length - 3, 0);
+    for (let skip = 0; skip <= maxSkip; skip++) {
+        const candidate = letters.slice(skip, skip + 3).padEnd(3, 'X');
         if (!taken.has(candidate))
             return candidate;
     }
-    return base; // exhausted A-Z shifts — extremely unlikely; falls back to the unique index to reject
+    // Name too short to yield more distinct 3-letter windows (or all exhausted) — extremely
+    // unlikely in practice. Falls back to a numeric suffix rather than looping forever or
+    // silently returning a duplicate (which the unique index would reject anyway).
+    const base = (letters.slice(0, 3) || 'BRN').padEnd(3, 'X');
+    for (let n = 1; n <= 99; n++) {
+        const candidate = `${base.slice(0, 1)}${n.toString().padStart(2, '0')}`;
+        if (!taken.has(candidate))
+            return candidate;
+    }
+    return base;
 }
 // Rough bounding box, not an exact polygon — the PRD only asks that a pin "outside Indian
 // territory" be rejected. A handful of border pixels near Pakistan/Nepal/Bangladesh/China/
@@ -84,7 +91,7 @@ router.get('/', async (req, res) => {
         // Attach service + staff counts, plus the Branch Card's "Revenue & Orders" tag
         // (current calendar month, mirroring /dashboard/stats' convention of filtering by
         // createdAt window + current status rather than a point-in-time history join).
-        const monthStart = DateTime.now().toUTC().startOf('month').toISO();
+        const monthStart = nowInBusinessTz().startOf('month').toUTC().toISO();
         const enriched = await Promise.all(branches.map(async (b) => {
             const [serviceCount, staffCount, revenueAgg, orderCount] = await Promise.all([
                 BranchService.countDocuments({ branch_id: b._id }),
@@ -208,6 +215,14 @@ router.delete('/:id', authorizeRoles('owner'), async (req, res) => {
         const branch = await Branch.findOne({ _id: req.params.id, business_id: req.user.businessId, deleted_at: null });
         if (!branch)
             return res.status(404).json({ message: 'Branch not found' });
+        // A business must always have at least one branch — without one, it has no way to
+        // create orders/services/staff assignments at all. Registration guarantees every
+        // business starts with a branch (see auth.ts#register-business); this guarantees it
+        // never drops back down to zero.
+        const branchCount = await Branch.countDocuments({ business_id: req.user.businessId, deleted_at: null });
+        if (branchCount <= 1) {
+            return res.status(400).json({ message: 'A business must have at least one branch — create another branch before deleting this one.' });
+        }
         branch.deleted_at = DateTime.now().toUTC().toISO();
         await branch.save();
         // PRD: "All orders connected to this branch also gets deleted." Soft-deletes them

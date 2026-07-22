@@ -4,6 +4,7 @@ import mongoose from 'mongoose';
 import { Order, OrderRating, OrderStatusHistory, Branch, UserBranch } from '../models.js';
 import { sessionVerification, authorizeRoles, getAccessibleBranchIds, type AuthRequest } from '../middleware/auth.js';
 import { delayedMatchCondition } from '../utils/orderDelay.js';
+import { nowInBusinessTz, parseDateInBusinessTz, toBusinessDateString } from '../utils/timezone.js';
 
 const router = Router();
 router.use(sessionVerification);
@@ -33,12 +34,14 @@ async function branchFilter(user: AuthRequest['user'], branchId?: string): Promi
 router.get('/quickview', async (req: AuthRequest, res) => {
   try {
     const { branch_id } = req.query;
-    const today = DateTime.now().toUTC().toFormat("yyyy-MM-dd");
+    const todayIST = nowInBusinessTz();
+    const todayStartUTC = todayIST.startOf('day').toUTC().toISO()!;
+    const todayEndUTC = todayIST.endOf('day').toUTC().toISO()!;
     const { match, error } = await branchFilter(req.user, branch_id as string);
     if (error) return res.status(403).json({ message: error });
     const todayMatch = {
       ...match,
-      createdAt: { $gte: today, $lte: `${today}T23:59:59.999Z` },
+      createdAt: { $gte: todayStartUTC, $lte: todayEndUTC },
     };
 
     const [
@@ -53,7 +56,7 @@ router.get('/quickview', async (req: AuthRequest, res) => {
       Order.aggregate([{ $match: { ...todayMatch, status: 'paid' } }, { $group: { _id: null, total: { $sum: '$total_price' } } }]),
       Order.countDocuments({ ...match, status: { $in: ['created', 'in_progress'] } }),
       Order.countDocuments({ ...match, ...delayedMatchCondition(DateTime.now().toUTC().toISO()!) }),
-      Order.countDocuments({ ...match, status: 'cancelled', createdAt: { $gte: today } }),
+      Order.countDocuments({ ...match, status: 'cancelled', createdAt: { $gte: todayStartUTC } }),
       Order.find(match)
         .populate('branch_id', 'name branch_code')
         .sort({ createdAt: -1 })
@@ -91,17 +94,17 @@ router.get('/timeline', async (req: AuthRequest, res) => {
     let endDt: DateTime;
     if (start_date || end_date) {
       startDt = start_date
-        ? DateTime.fromISO(start_date as string).toUTC().startOf('day')
-        : DateTime.now().toUTC().minus({ days: 6 }).startOf('day');
+        ? parseDateInBusinessTz(start_date as string).startOf('day')
+        : nowInBusinessTz().minus({ days: 6 }).startOf('day');
       endDt = end_date
-        ? DateTime.fromISO(end_date as string).toUTC().endOf('day')
-        : DateTime.now().toUTC().endOf('day');
+        ? parseDateInBusinessTz(end_date as string).endOf('day')
+        : nowInBusinessTz().endOf('day');
     } else {
       // Default view: today centered in the window (per PRD's "current date sits in the
       // middle by default"), spanning `days` total (9 to match the PRD's desktop example).
       const windowSize = daysParam ? Math.max(1, parseInt(daysParam as string)) : 9;
       const before = Math.floor((windowSize - 1) / 2);
-      startDt = DateTime.now().toUTC().minus({ days: before }).startOf('day');
+      startDt = nowInBusinessTz().minus({ days: before }).startOf('day');
       endDt = startDt.plus({ days: windowSize - 1 }).endOf('day');
     }
 
@@ -119,8 +122,12 @@ router.get('/timeline', async (req: AuthRequest, res) => {
       cursor = cursor.plus({ days: 1 });
     }
 
-    const startISO = startDt.toISO()!;
-    const endISO = endDt.toISO()!;
+    // startDt/endDt are IST-zoned (so the calendar-day boundary itself is correct in IST),
+    // but the query needs UTC ISO strings to compare correctly against the UTC-stored
+    // createdAt/delivery_due_date/changed_at fields — a "+05:30"-offset ISO string doesn't
+    // sort correctly against 'Z'-suffixed UTC strings under plain lexicographic comparison.
+    const startISO = startDt.toUTC().toISO()!;
+    const endISO = endDt.toUTC().toISO()!;
 
     const [ordersInRange, historyEntries] = await Promise.all([
       Order.find({
@@ -147,23 +154,23 @@ router.get('/timeline', async (req: AuthRequest, res) => {
 
     for (const order of ordersInRange) {
       if (order.status === 'cancelled') continue;
-      const createdDay = DateTime.fromISO(order.createdAt).toFormat('yyyy-MM-dd');
+      const createdDay = toBusinessDateString(order.createdAt);
       if (matrix[createdDay]) matrix[createdDay].created++;
       if (order.delivery_due_date) {
-        const dueDay = DateTime.fromISO(order.delivery_due_date).toFormat('yyyy-MM-dd');
+        const dueDay = toBusinessDateString(order.delivery_due_date);
         if (matrix[dueDay]) matrix[dueDay].order_due++;
       }
     }
 
     for (const h of historyEntries) {
-      const d = DateTime.fromISO(h.changed_at).toFormat('yyyy-MM-dd');
+      const d = toBusinessDateString(h.changed_at);
       if (!matrix[d]) continue;
       if (h.status === 'completed' && ['completed', 'paid'].includes(h.current_status)) matrix[d].completed++;
       else if (h.status === 'paid' && h.current_status === 'paid') matrix[d].paid++;
       else if (h.status === 'cancelled') matrix[d].cancelled++;
     }
 
-    res.json({ dates, statuses, matrix, today: DateTime.now().toUTC().toFormat('yyyy-MM-dd') });
+    res.json({ dates, statuses, matrix, today: nowInBusinessTz().toFormat('yyyy-MM-dd') });
   } catch (err: any) {
     res.status(500).json({ message: err.message });
   }

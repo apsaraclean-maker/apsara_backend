@@ -1,9 +1,9 @@
 import { Router } from 'express';
-import { DateTime } from 'luxon';
 import mongoose from 'mongoose';
 import { Order, OrderService, OrderStatusHistory } from '../models.js';
 import { sessionVerification, authorizeRoles, getAccessibleBranchIds } from '../middleware/auth.js';
 import { isOrderDelayed } from '../utils/orderDelay.js';
+import { nowInBusinessTz, parseDateInBusinessTz } from '../utils/timezone.js';
 const router = Router();
 router.use(sessionVerification);
 const DURATION_DAYS = { daily: 1, weekly: 7, monthly: 30, quarterly: 90, yearly: 365 };
@@ -11,15 +11,15 @@ const DURATION_DAYS = { daily: 1, weekly: 7, monthly: 30, quarterly: 90, yearly:
 router.get('/sales', authorizeRoles('owner', 'manager'), async (req, res) => {
     try {
         const { duration, start_date, end_date, branch_id } = req.query;
-        const now = DateTime.now().toUTC();
+        const now = nowInBusinessTz();
         let startDt;
         let endDt = now.endOf('day');
         if (duration === 'custom') {
             if (!start_date || !end_date) {
                 return res.status(400).json({ message: 'start_date and end_date required for custom duration' });
             }
-            startDt = DateTime.fromISO(start_date).startOf('day');
-            endDt = DateTime.fromISO(end_date).endOf('day');
+            startDt = parseDateInBusinessTz(start_date).startOf('day');
+            endDt = parseDateInBusinessTz(end_date).endOf('day');
         }
         else {
             // Rolling trailing window ending now, matching /dashboard/stats' convention
@@ -31,10 +31,13 @@ router.get('/sales', authorizeRoles('owner', 'manager'), async (req, res) => {
         if (accessibleBranchIds !== null && branch_id && !accessibleBranchIds.includes(branch_id)) {
             return res.status(403).json({ message: 'Access to this branch is not permitted' });
         }
+        // startDt/endDt are IST-zoned so the calendar boundary itself is correct; convert to
+        // UTC here since createdAt is stored as UTC ISO strings and a "+05:30"-offset string
+        // wouldn't compare correctly against them.
         const match = {
             business_id: new mongoose.Types.ObjectId(req.user.businessId),
             deleted_at: null,
-            createdAt: { $gte: startDt.toISO(), $lte: endDt.toISO() },
+            createdAt: { $gte: startDt.toUTC().toISO(), $lte: endDt.toUTC().toISO() },
         };
         if (branch_id) {
             match.branch_id = new mongoose.Types.ObjectId(branch_id);
@@ -81,7 +84,7 @@ router.get('/sales', authorizeRoles('owner', 'manager'), async (req, res) => {
                 order_status: o.status,
                 delayed: isOrderDelayed(o) ? 'Delayed' : '',
                 customer_contact: o.customer_mobile,
-                created_by: o.created_by?.name || '',
+                created_by: o.created_by?.name || o.created_by_name_snapshot || '',
                 order: itemsList,
                 note: o.notes || '',
                 extra_price: o.extra_charges || 0,
