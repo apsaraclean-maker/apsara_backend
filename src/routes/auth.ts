@@ -5,6 +5,7 @@ import crypto from 'crypto';
 import { DateTime } from 'luxon';
 import { User, Business, OTP } from '../models.js';
 import { generateToken, sessionVerification, type AuthRequest } from '../middleware/auth.js';
+import { decryptPin } from '../utils/pinCrypto.js';
 
 const router = Router();
 
@@ -108,7 +109,17 @@ router.post('/login', async (req, res) => {
       }
     }
 
-    const isMatch = await bcrypt.compare(password, user.password_hash);
+    // Owners/admins log in with their password; managers/workers log in with their PIN
+    // (decided during planning — PIN replaces password for staff login). A staff member
+    // with no PIN set yet simply cannot log in until the owner sets one. PINs are
+    // reversibly encrypted (not hashed) so the owner can view them on the Staff Page,
+    // so the check here is decrypt-and-compare instead of bcrypt.compare.
+    let isMatch: boolean;
+    if (user.role === 'owner' || user.role === 'admin') {
+      isMatch = await bcrypt.compare(password, user.password_hash);
+    } else {
+      isMatch = !!user.pin_encrypted && decryptPin(user.pin_encrypted) === password;
+    }
     if (!isMatch) {
       user.failed_login_count = (user.failed_login_count || 0) + 1;
       if (user.failed_login_count >= MAX_FAILED_ATTEMPTS) {
@@ -157,7 +168,7 @@ router.post('/logout', (req, res) => {
 router.get('/me', sessionVerification, async (req: AuthRequest, res) => {
   try {
     const user = await User.findOne({ _id: req.user!.id, is_active: true, deleted_at: null }).select(
-      '-password_hash -pin_hash'
+      '-password_hash -pin_encrypted'
     );
     if (!user) return res.status(404).json({ message: 'User not found' });
     res.json(user);

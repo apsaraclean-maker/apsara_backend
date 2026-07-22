@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { DateTime } from 'luxon';
-import { Branch, BranchService, UserBranch, Service, User } from '../models.js';
+import { Branch, BranchService, UserBranch, Service, User, Order } from '../models.js';
 import { sessionVerification, authorizeRoles, getAccessibleBranchIds, type AuthRequest } from '../middleware/auth.js';
 
 const router = Router();
@@ -26,6 +26,42 @@ function generateBranchCode(name: string, existingCodes: string[]): string {
   return base; // exhausted A-Z shifts — extremely unlikely; falls back to the unique index to reject
 }
 
+// Rough bounding box, not an exact polygon — the PRD only asks that a pin "outside Indian
+// territory" be rejected. A handful of border pixels near Pakistan/Nepal/Bangladesh/China/
+// Myanmar/Sri Lanka could false-positive as "inside"; an exact polygon check would need a
+// real geo dataset, which is out of scope for this validation.
+const INDIA_BOUNDS = { minLat: 6.0, maxLat: 37.6, minLng: 68.0, maxLng: 97.5 };
+function isWithinIndia(lat: number, lng: number): boolean {
+  return lat >= INDIA_BOUNDS.minLat && lat <= INDIA_BOUNDS.maxLat && lng >= INDIA_BOUNDS.minLng && lng <= INDIA_BOUNDS.maxLng;
+}
+
+function validateBranchFields(body: any, isCreate: boolean): string | null {
+  const { name, address_line_1, address_line_2, pincode, city, state, latitude, longitude } = body;
+  if (isCreate || name !== undefined) {
+    if (!name?.trim()) return 'Branch name is required';
+    if (name.length > 100) return 'Branch name cannot exceed 100 characters';
+  }
+  if (isCreate || address_line_1 !== undefined) {
+    if (!address_line_1?.trim()) return 'Address Line 1 is required';
+    if (address_line_1.length > 100) return 'Address Line 1 cannot exceed 100 characters';
+  }
+  if (address_line_2 && address_line_2.length > 100) return 'Address Line 2 cannot exceed 100 characters';
+  if (isCreate || pincode !== undefined) {
+    if (!pincode?.trim()) return 'Pincode is required';
+  }
+  if (isCreate || city !== undefined) {
+    if (!city?.trim()) return 'City is required';
+  }
+  if (isCreate || state !== undefined) {
+    if (!state?.trim()) return 'State is required';
+  }
+  if (isCreate || latitude !== undefined || longitude !== undefined) {
+    if (typeof latitude !== 'number' || typeof longitude !== 'number') return 'Branch location is required';
+    if (!isWithinIndia(latitude, longitude)) return 'Pin cannot be in unserviceable Area.';
+  }
+  return null;
+}
+
 // GET /api/branches
 router.get('/', async (req: AuthRequest, res) => {
   try {
@@ -41,14 +77,28 @@ router.get('/', async (req: AuthRequest, res) => {
       branches = await Branch.find({ _id: { $in: branchIds }, deleted_at: null }).sort({ createdAt: -1 });
     }
 
-    // Attach service + staff counts
+    // Attach service + staff counts, plus the Branch Card's "Revenue & Orders" tag
+    // (current calendar month, mirroring /dashboard/stats' convention of filtering by
+    // createdAt window + current status rather than a point-in-time history join).
+    const monthStart = DateTime.now().toUTC().startOf('month').toISO()!;
     const enriched = await Promise.all(
       branches.map(async (b) => {
-        const [serviceCount, staffCount] = await Promise.all([
+        const [serviceCount, staffCount, revenueAgg, orderCount] = await Promise.all([
           BranchService.countDocuments({ branch_id: b._id }),
           UserBranch.countDocuments({ branch_id: b._id }),
+          Order.aggregate([
+            { $match: { branch_id: b._id, status: 'paid', createdAt: { $gte: monthStart } } },
+            { $group: { _id: null, total: { $sum: '$total_price' } } },
+          ]),
+          Order.countDocuments({ branch_id: b._id, deleted_at: null, createdAt: { $gte: monthStart } }),
         ]);
-        return { ...b.toObject(), service_count: serviceCount, staff_count: staffCount };
+        return {
+          ...b.toObject(),
+          service_count: serviceCount,
+          staff_count: staffCount,
+          monthly_revenue: revenueAgg[0]?.total || 0,
+          monthly_orders: orderCount,
+        };
       })
     );
 
@@ -71,7 +121,7 @@ router.get('/:id', async (req: AuthRequest, res) => {
 
     const [services, staff] = await Promise.all([
       BranchService.find({ branch_id: branch._id }).populate('service_id'),
-      UserBranch.find({ branch_id: branch._id }).populate('user_id', '-password_hash -pin_hash'),
+      UserBranch.find({ branch_id: branch._id }).populate('user_id', '-password_hash -pin_encrypted'),
     ]);
 
     res.json({ ...branch.toObject(), services, staff });
@@ -82,8 +132,11 @@ router.get('/:id', async (req: AuthRequest, res) => {
 
 // POST /api/branches
 router.post('/', authorizeRoles('owner'), async (req: AuthRequest, res) => {
-  const { name, city, state, address, latitude, longitude, service_ids, staff_ids } = req.body;
+  const { name, address_line_1, address_line_2, pincode, city, state, latitude, longitude, service_ids, staff_ids } = req.body;
   try {
+    const validationError = validateBranchFields(req.body, true);
+    if (validationError) return res.status(400).json({ message: validationError });
+
     const existing = await Branch.find({ business_id: req.user!.businessId, deleted_at: null }).select('branch_code');
     const branch_code = generateBranchCode(name, existing.map((b) => b.branch_code));
 
@@ -91,11 +144,13 @@ router.post('/', authorizeRoles('owner'), async (req: AuthRequest, res) => {
       business_id: req.user!.businessId,
       name,
       branch_code,
-      city: city || '',
-      state: state || '',
-      address: address || '',
-      latitude: latitude || null,
-      longitude: longitude || null,
+      address_line_1,
+      address_line_2: address_line_2 || '',
+      pincode,
+      city,
+      state,
+      latitude,
+      longitude,
     });
 
     if (service_ids?.length) {
@@ -118,16 +173,21 @@ router.post('/', authorizeRoles('owner'), async (req: AuthRequest, res) => {
 
 // PUT /api/branches/:id
 router.put('/:id', authorizeRoles('owner'), async (req: AuthRequest, res) => {
-  const { name, branch_code, city, state, address, latitude, longitude } = req.body;
+  const { name, branch_code, address_line_1, address_line_2, pincode, city, state, latitude, longitude } = req.body;
   try {
+    const validationError = validateBranchFields(req.body, false);
+    if (validationError) return res.status(400).json({ message: validationError });
+
     const branch = await Branch.findOne({ _id: req.params.id, business_id: req.user!.businessId, deleted_at: null });
     if (!branch) return res.status(404).json({ message: 'Branch not found' });
 
     if (name) branch.name = name;
     if (branch_code) branch.branch_code = branch_code.toUpperCase();
+    if (address_line_1 !== undefined) branch.address_line_1 = address_line_1;
+    if (address_line_2 !== undefined) branch.address_line_2 = address_line_2;
+    if (pincode !== undefined) branch.pincode = pincode;
     if (city !== undefined) branch.city = city;
     if (state !== undefined) branch.state = state;
-    if (address !== undefined) branch.address = address;
     if (latitude !== undefined) branch.latitude = latitude;
     if (longitude !== undefined) branch.longitude = longitude;
     branch.updatedAt = DateTime.now().toUTC().toISO()!;
@@ -149,10 +209,16 @@ router.delete('/:id', authorizeRoles('owner'), async (req: AuthRequest, res) => 
     branch.deleted_at = DateTime.now().toUTC().toISO()!;
     await branch.save();
 
-    // PRD: "the link of staff and service to this branch gets disconnected." Order
-    // deletion cascade (also specified in the PRD) is deliberately not done here — it
-    // belongs to the Business Page's delete-branch flow (Phase 7), which needs its own
-    // explicit confirmation copy given the data loss involved.
+    // PRD: "All orders connected to this branch also gets deleted." Soft-deletes them
+    // (deleted_at, same as the single-order DELETE route) rather than hard-deleting, so
+    // they're still swept by Phase 8's eventual 3-month hard-delete purge job — consistent
+    // with every other delete in this app, and avoids losing the audit trail immediately.
+    await Order.updateMany(
+      { branch_id: branch._id, business_id: req.user!.businessId, deleted_at: null },
+      { deleted_at: DateTime.now().toUTC().toISO() }
+    );
+
+    // PRD: "the link of staff and service to this branch gets disconnected."
     const affectedServiceLinks = await BranchService.find({ branch_id: branch._id }).select('service_id');
     const affectedServiceIds = affectedServiceLinks.map((l) => l.service_id);
     const affectedStaffLinks = await UserBranch.find({ branch_id: branch._id }).select('user_id');
@@ -183,9 +249,25 @@ router.delete('/:id', authorizeRoles('owner'), async (req: AuthRequest, res) => 
 
 // ─── Branch ↔ Services ────────────────────────────────────────────────────────
 
+// Verifies the branch exists within the caller's own business AND (for managers/workers)
+// that they're actually assigned to it. Previously these branch-scoped sub-resource routes
+// had no such check at all — not even a business_id scope — so any authenticated user of
+// *any* business could pass an arbitrary branch id from a different business entirely and
+// read its linked services/staff.
+async function verifyBranchAccess(req: AuthRequest, branchId: string): Promise<boolean> {
+  const branch = await Branch.findOne({ _id: branchId, business_id: req.user!.businessId, deleted_at: null });
+  if (!branch) return false;
+  const accessible = await getAccessibleBranchIds(req.user!);
+  if (accessible !== null && !accessible.includes(String(branch._id))) return false;
+  return true;
+}
+
 // GET /api/branches/:id/services
 router.get('/:id/services', async (req: AuthRequest, res) => {
   try {
+    if (!(await verifyBranchAccess(req, req.params.id))) {
+      return res.status(403).json({ message: 'Access to this branch is not permitted' });
+    }
     const links = await BranchService.find({ branch_id: req.params.id }).populate('service_id');
     res.json(links.map((l) => l.service_id));
   } catch (err: any) {
@@ -196,6 +278,8 @@ router.get('/:id/services', async (req: AuthRequest, res) => {
 // POST /api/branches/:id/services/:serviceId
 router.post('/:id/services/:serviceId', authorizeRoles('owner'), async (req: AuthRequest, res) => {
   try {
+    const branch = await Branch.findOne({ _id: req.params.id, business_id: req.user!.businessId, deleted_at: null });
+    if (!branch) return res.status(404).json({ message: 'Branch not found' });
     const service = await Service.findOne({ _id: req.params.serviceId, business_id: req.user!.businessId });
     if (!service) return res.status(404).json({ message: 'Service not found' });
 
@@ -213,6 +297,9 @@ router.post('/:id/services/:serviceId', authorizeRoles('owner'), async (req: Aut
 // DELETE /api/branches/:id/services/:serviceId
 router.delete('/:id/services/:serviceId', authorizeRoles('owner'), async (req: AuthRequest, res) => {
   try {
+    const branch = await Branch.findOne({ _id: req.params.id, business_id: req.user!.businessId, deleted_at: null });
+    if (!branch) return res.status(404).json({ message: 'Branch not found' });
+
     await BranchService.deleteOne({ branch_id: req.params.id, service_id: req.params.serviceId });
     res.json({ message: 'Service unlinked from branch' });
   } catch (err: any) {
@@ -225,9 +312,12 @@ router.delete('/:id/services/:serviceId', authorizeRoles('owner'), async (req: A
 // GET /api/branches/:id/staff
 router.get('/:id/staff', async (req: AuthRequest, res) => {
   try {
+    if (!(await verifyBranchAccess(req, req.params.id))) {
+      return res.status(403).json({ message: 'Access to this branch is not permitted' });
+    }
     const links = await UserBranch.find({ branch_id: req.params.id }).populate(
       'user_id',
-      '-password_hash -pin_hash'
+      '-password_hash -pin_encrypted'
     );
     res.json(links.map((l) => l.user_id));
   } catch (err: any) {
@@ -238,6 +328,8 @@ router.get('/:id/staff', async (req: AuthRequest, res) => {
 // POST /api/branches/:id/staff/:userId
 router.post('/:id/staff/:userId', authorizeRoles('owner'), async (req: AuthRequest, res) => {
   try {
+    const branch = await Branch.findOne({ _id: req.params.id, business_id: req.user!.businessId, deleted_at: null });
+    if (!branch) return res.status(404).json({ message: 'Branch not found' });
     const user = await User.findOne({ _id: req.params.userId, business_id: req.user!.businessId, deleted_at: null });
     if (!user) return res.status(404).json({ message: 'Staff not found' });
 
@@ -255,6 +347,9 @@ router.post('/:id/staff/:userId', authorizeRoles('owner'), async (req: AuthReque
 // DELETE /api/branches/:id/staff/:userId
 router.delete('/:id/staff/:userId', authorizeRoles('owner'), async (req: AuthRequest, res) => {
   try {
+    const branch = await Branch.findOne({ _id: req.params.id, business_id: req.user!.businessId, deleted_at: null });
+    if (!branch) return res.status(404).json({ message: 'Branch not found' });
+
     await UserBranch.deleteOne({ user_id: req.params.userId, branch_id: req.params.id });
     res.json({ message: 'Staff unlinked from branch' });
   } catch (err: any) {

@@ -14,6 +14,7 @@ export type BusinessStatus = 'active' | 'inactive' | 'blocked';
 const businessSchema = new mongoose.Schema({
   name: { type: String, required: true },
   gst_number: { type: String, default: '' },
+  social_link: { type: String, default: '' },
   owner_id: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
   overall_rating_cache: { type: Number, default: 0 },
   status: { type: String, enum: ['active', 'inactive', 'blocked'], default: 'active' },
@@ -34,9 +35,11 @@ const branchSchema = new mongoose.Schema({
   business_id: { type: mongoose.Schema.Types.ObjectId, ref: 'Business', required: true },
   name: { type: String, required: true },
   branch_code: { type: String, required: true },
+  address_line_1: { type: String, default: '' },
+  address_line_2: { type: String, default: '' },
+  pincode: { type: String, default: '' },
   city: { type: String, default: '' },
   state: { type: String, default: '' },
-  address: { type: String, default: '' },
   latitude: { type: Number, default: null },
   longitude: { type: Number, default: null },
   deleted_at: { type: String, default: null },
@@ -54,7 +57,7 @@ const userSchema = new mongoose.Schema({
   name: { type: String, required: true },
   phone: { type: String, required: true, unique: true },
   password_hash: { type: String, required: true },
-  pin_hash: { type: String, default: null },
+  pin_encrypted: { type: String, default: null },
   role: { type: String, enum: ['admin', 'owner', 'manager', 'worker'], required: true },
   employee_id: { type: String, default: null },
   is_active: { type: Boolean, default: true },
@@ -65,7 +68,15 @@ const userSchema = new mongoose.Schema({
   updatedAt: { type: String, default: getUTCNow },
 });
 userSchema.index({ business_id: 1, role: 1 });
-userSchema.index({ phone: 1 });
+// Guards against the race condition in generateEmployeeId() (staff.ts) — two concurrent
+// "add manager" requests could otherwise both read the same existing-IDs list and compute
+// the same new employee_id before either write lands. Partial index (only documents where
+// employee_id is an actual string) so workers, who always have employee_id: null, don't
+// collide with each other.
+userSchema.index(
+  { business_id: 1, employee_id: 1 },
+  { unique: true, partialFilterExpression: { employee_id: { $type: 'string' } } }
+);
 export const User = mongoose.model('User', userSchema);
 
 // ─── UserBranch (junction) ────────────────────────────────────────────────────
@@ -181,7 +192,6 @@ const orderRatingSchema = new mongoose.Schema({
   submitted_at: { type: String, default: null },
   createdAt: { type: String, default: getUTCNow },
 });
-orderRatingSchema.index({ rating_token: 1 });
 export const OrderRating = mongoose.model('OrderRating', orderRatingSchema);
 
 // ─── OrderDailyCounter ────────────────────────────────────────────────────────

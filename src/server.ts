@@ -10,9 +10,11 @@ import cookieParser from 'cookie-parser';
 import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
+import cron from 'node-cron';
 
 import { redisClient } from './config/redis.js';
 import { seedDatabase } from './config/seed.js';
+import { purgeExpiredSoftDeletes } from './config/purge.js';
 
 import authRoutes from './routes/auth.js';
 import branchRoutes from './routes/branches.js';
@@ -24,6 +26,7 @@ import serviceRoutes from './routes/services.js';
 import staffRoutes from './routes/staff.js';
 import adminRoutes from './routes/admin.js';
 import analyticsRoutes from './routes/analytics.js';
+import geocodeRoutes from './routes/geocode.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -57,7 +60,10 @@ async function startServer() {
   app.set('trust proxy', 1);
   app.use(express.json({ limit: '10mb' }));
   app.use(cookieParser());
-  app.use('/uploads', express.static(uploadsDir));
+  // nosniff: uploaded order images are validated by extension+mimetype, not real content
+  // sniffing, so this stops a browser from re-interpreting a served file as something other
+  // than its declared type.
+  app.use('/uploads', express.static(uploadsDir, { setHeaders: (res) => res.setHeader('X-Content-Type-Options', 'nosniff') }));
 
   // ─── CORS ───────────────────────────────────────────────────────────────────
   app.use((req, res, next) => {
@@ -103,6 +109,7 @@ async function startServer() {
   app.use('/api/staff', staffRoutes);
   app.use('/api/admin', adminRoutes);
   app.use('/api/analytics', analyticsRoutes);
+  app.use('/api/geocode', geocodeRoutes);
 
   // Master data
   app.get('/api/master/articles', async (_req, res) => {
@@ -118,6 +125,13 @@ async function startServer() {
 
   // Health check
   app.get('/check-status', (_req, res) => res.json({ message: 'Ok' }));
+
+  // ─── Housekeeping ───────────────────────────────────────────────────────────
+  // Daily at 3am — hard-deletes soft-deleted orders/services/staff/branches past the
+  // 3-month retention window (PRD requirement, Phase 8).
+  cron.schedule('0 3 * * *', () => {
+    purgeExpiredSoftDeletes().catch((err) => console.error('[purge] failed:', err));
+  });
 
   // ─── Start ──────────────────────────────────────────────────────────────────
   app.listen(PORT, () => console.log(`Server running on http://localhost:${PORT}`));

@@ -19,6 +19,7 @@ import {
 } from '../models.js';
 import { sessionVerification, authorizeRoles, getAccessibleBranchIds, type AuthRequest } from '../middleware/auth.js';
 import { buildWhatsAppMessage, type WhatsAppEvent } from '../services/whatsapp.js';
+import { isOrderDelayed, delayedMatchCondition } from '../utils/orderDelay.js';
 
 // True if the caller (already business-scoped by whatever lookup found `order`) is also
 // allowed to touch this specific order's branch (owners are unrestricted; managers/workers
@@ -50,12 +51,17 @@ const storage = multer.diskStorage({
   },
 });
 
+// Anchored extension check (was an unanchored substring test — `image.jpegx` would have
+// matched `/jpeg|jpg|png|webp/` since it contains "jpeg") plus an exact mimetype allowlist
+// (was the same unanchored regex against the client-supplied, spoofable mimetype string).
+const ALLOWED_IMAGE_EXT = /^\.(jpeg|jpg|png|webp)$/i;
+const ALLOWED_IMAGE_MIME = new Set(['image/jpeg', 'image/png', 'image/webp']);
+
 const upload = multer({
   storage,
   limits: { fileSize: 5 * 1024 * 1024 },
   fileFilter: (_req, file, cb) => {
-    const allowed = /jpeg|jpg|png|webp/;
-    if (allowed.test(path.extname(file.originalname).toLowerCase()) && allowed.test(file.mimetype)) {
+    if (ALLOWED_IMAGE_EXT.test(path.extname(file.originalname)) && ALLOWED_IMAGE_MIME.has(file.mimetype)) {
       cb(null, true);
     } else {
       cb(new Error('Only images (jpeg, jpg, png, webp) are allowed'));
@@ -64,7 +70,95 @@ const upload = multer({
 });
 
 const router = Router();
+
+// ─── Public rating/invoice routes ──────────────────────────────────────────────
+// Registered before `router.use(sessionVerification)` below — this page is meant to be
+// reachable by an anonymous customer clicking a WhatsApp link, with the 192-bit
+// `rating_token` itself acting as the access control, not a login session. Previously
+// these were defined *after* the sessionVerification middleware on this same router, which
+// meant every request to them was rejected with 401 before ever reaching the handler —
+// the entire public rating/invoice page was non-functional for real, unauthenticated
+// customers. Express applies middleware/routes in registration order per request, so
+// moving these two above the `.use()` call is what actually makes them public.
+
+// GET /api/orders/rate/:token
+router.get('/rate/:token', async (req, res) => {
+  try {
+    const rating = await OrderRating.findOne({ rating_token: req.params.token });
+    if (!rating) return res.status(404).json({ message: 'Rating link not found or expired' });
+
+    // deleted_at check matters here: every other order-reading route filters it out, but
+    // this one previously didn't — a soft-deleted order's rating link stayed fully
+    // browsable (and rateable) indefinitely. Reuses the same "not found or expired" message
+    // as a missing token so a deleted order isn't distinguishable from a bad link.
+    const order = await Order.findOne({ _id: rating.order_id, deleted_at: null })
+      .populate('branch_id', 'name')
+      .populate('business_id', 'name');
+    if (!order) return res.status(404).json({ message: 'Rating link not found or expired' });
+
+    const items = await OrderService.find({ order_id: order._id });
+
+    res.json({
+      order: { ...order.toObject(), items },
+      rating: {
+        submitted: rating.submitted_at !== null,
+        overall_rating: rating.overall_rating,
+        speed_rating: rating.speed_rating,
+        quality_rating: rating.quality_rating,
+      },
+    });
+  } catch (err: any) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// POST /api/orders/rate/:token
+router.post('/rate/:token', async (req, res) => {
+  const { overall_rating, speed_rating, quality_rating } = req.body;
+  const isValidRating = (v: any) => v === undefined || (Number.isInteger(v) && v >= 1 && v <= 5);
+  if (!Number.isInteger(overall_rating) || overall_rating < 1 || overall_rating > 5) {
+    return res.status(400).json({ message: 'overall_rating must be an integer from 1 to 5' });
+  }
+  if (!isValidRating(speed_rating) || !isValidRating(quality_rating)) {
+    return res.status(400).json({ message: 'Ratings must be an integer from 1 to 5' });
+  }
+  try {
+    const rating = await OrderRating.findOne({ rating_token: req.params.token });
+    if (!rating) return res.status(404).json({ message: 'Rating link not found or expired' });
+    const order = await Order.findOne({ _id: rating.order_id, deleted_at: null }).select('_id');
+    if (!order) return res.status(404).json({ message: 'Rating link not found or expired' });
+    if (rating.submitted_at) return res.status(400).json({ message: 'Rating already submitted' });
+
+    rating.overall_rating = overall_rating;
+    rating.speed_rating = speed_rating;
+    rating.quality_rating = quality_rating;
+    rating.submitted_at = DateTime.now().toUTC().toISO()!;
+    await rating.save();
+
+    res.json({ message: 'Thank you for your rating!' });
+  } catch (err: any) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
 router.use(sessionVerification);
+
+// The status progress bar only ever moves one adjacent step at a time (forward via
+// stepForward/stepBackward), cancels from created/in_progress only, and reopens a cancelled
+// order straight back to created (Order Detail Page, orders/[id]/page.tsx) — but the API
+// itself never enforced any of that, so a direct call could e.g. cancel a paid order or jump
+// straight from created to paid. This mirrors the frontend's actual button-permitted set
+// exactly (no more, no less) rather than inventing a stricter rule the UI doesn't need.
+const STATUS_STEPS = ['created', 'in_progress', 'completed', 'paid'];
+function isValidStatusTransition(from: string, to: string): boolean {
+  if (from === to) return false;
+  if (from === 'cancelled') return to === 'created'; // reopen
+  if (to === 'cancelled') return from === 'created' || from === 'in_progress'; // cancel
+  const fromIdx = STATUS_STEPS.indexOf(from);
+  const toIdx = STATUS_STEPS.indexOf(to);
+  if (fromIdx === -1 || toIdx === -1) return false;
+  return Math.abs(fromIdx - toIdx) === 1;
+}
 
 // Order number format: {branchCode}-{employeeId}-{YYMMDD}-{counter}, counter is base-36
 // (001-ZZZ), reset daily per branch. Matches the PRD's Order Card UI calculation logic
@@ -95,7 +189,6 @@ router.get('/', async (req: AuthRequest, res) => {
     const match: any = { business_id: new mongoose.Types.ObjectId(req.user!.businessId!), deleted_at: null };
 
     if (status) match.status = status;
-    if (is_delayed === 'true') match.is_delayed = true;
     if (created_by) match.created_by = new mongoose.Types.ObjectId(created_by as string);
 
     if (min_price || max_price) {
@@ -154,6 +247,13 @@ router.get('/', async (req: AuthRequest, res) => {
           { customer_mobile: { $regex: escaped, $options: 'i' } },
         ],
       });
+    }
+
+    // "Delayed only" filter — matches the frontend's isOrderDelayed() fallback to a live
+    // due-date comparison, not just the is_delayed flag (which nothing in the app ever
+    // actually sets via its own PATCH route, so filtering on it alone always returned empty).
+    if (is_delayed === 'true') {
+      andConditions.push(delayedMatchCondition(DateTime.now().toUTC().toISO()!));
     }
 
     if (andConditions.length) match.$and = andConditions;
@@ -344,6 +444,15 @@ router.put('/:id', authorizeRoles('owner', 'manager'), async (req: AuthRequest, 
 
       if (orderItems.length) await OrderService.insertMany(orderItems);
       order.total_price = total_price;
+    } else if (extra_charges !== undefined) {
+      // items weren't resent but extra_charges changed — total_price still needs to reflect
+      // it. Previously this branch didn't exist, so total_price went stale whenever a caller
+      // updated extra_charges without also resending items (the current OrderForm always
+      // resends both together, so this was latent rather than user-visible, but the API
+      // itself allowed it).
+      const existingItems = await OrderService.find({ order_id: order._id }).select('line_total');
+      const itemsTotal = existingItems.reduce((sum, i) => sum + i.line_total, 0);
+      order.total_price = itemsTotal + order.extra_charges;
     }
 
     await order.save();
@@ -366,6 +475,9 @@ router.patch('/:id/status', authorizeRoles('owner', 'manager'), async (req: Auth
     if (!order) return res.status(404).json({ message: 'Order not found' });
     if (!(await hasOrderBranchAccess(req.user, order))) {
       return res.status(403).json({ message: 'Access to this branch is not permitted' });
+    }
+    if (!isValidStatusTransition(order.status, status)) {
+      return res.status(400).json({ message: `Cannot move an order from "${order.status}" to "${status}"` });
     }
 
     const prev_status = order.status;
@@ -429,11 +541,17 @@ router.patch('/:id/notes', authorizeRoles('owner', 'manager'), async (req: AuthR
   }
 });
 
-// DELETE /api/orders/:id (soft delete)
+// DELETE /api/orders/:id (soft delete) — the Order Card's Action Menu only shows "Delete
+// Order" once an order is cancelled (OrderCardMenu.tsx's canDelete), but the API itself
+// never enforced that, so a direct call could delete an order in any status. Enforced here
+// to match.
 router.delete('/:id', authorizeRoles('owner'), async (req: AuthRequest, res) => {
   try {
     const order = await Order.findOne({ _id: req.params.id, business_id: req.user!.businessId, deleted_at: null });
     if (!order) return res.status(404).json({ message: 'Order not found' });
+    if (order.status !== 'cancelled') {
+      return res.status(400).json({ message: 'Only cancelled orders can be deleted' });
+    }
 
     order.deleted_at = DateTime.now().toUTC().toISO()!;
     await order.save();
@@ -517,60 +635,11 @@ router.delete('/:id/images/:imageId', authorizeRoles('owner', 'manager'), async 
   }
 });
 
-// ─── Rating / Invoice ─────────────────────────────────────────────────────────
-
-// GET /api/orders/rate/:token
-router.get('/rate/:token', async (req, res) => {
-  try {
-    const rating = await OrderRating.findOne({ rating_token: req.params.token });
-    if (!rating) return res.status(404).json({ message: 'Rating link not found or expired' });
-
-    const order = await Order.findById(rating.order_id)
-      .populate('branch_id', 'name')
-      .populate('business_id', 'name');
-    if (!order) return res.status(404).json({ message: 'Order not found' });
-
-    const items = await OrderService.find({ order_id: order._id });
-
-    res.json({
-      order: { ...order.toObject(), items },
-      rating: {
-        submitted: rating.submitted_at !== null,
-        overall_rating: rating.overall_rating,
-        speed_rating: rating.speed_rating,
-        quality_rating: rating.quality_rating,
-      },
-    });
-  } catch (err: any) {
-    res.status(500).json({ message: err.message });
-  }
-});
-
-// POST /api/orders/rate/:token
-router.post('/rate/:token', async (req, res) => {
-  const { overall_rating, speed_rating, quality_rating } = req.body;
-  try {
-    const rating = await OrderRating.findOne({ rating_token: req.params.token });
-    if (!rating) return res.status(404).json({ message: 'Rating link not found' });
-    if (rating.submitted_at) return res.status(400).json({ message: 'Rating already submitted' });
-
-    rating.overall_rating = overall_rating;
-    rating.speed_rating = speed_rating;
-    rating.quality_rating = quality_rating;
-    rating.submitted_at = DateTime.now().toUTC().toISO()!;
-    await rating.save();
-
-    res.json({ message: 'Thank you for your rating!' });
-  } catch (err: any) {
-    res.status(500).json({ message: err.message });
-  }
-});
-
 // GET /api/orders/:id/invoice
 router.get('/:id/invoice', async (req: AuthRequest, res) => {
   try {
     const order = await Order.findOne({ _id: req.params.id, business_id: req.user!.businessId, deleted_at: null })
-      .populate('branch_id', 'name branch_code address')
+      .populate('branch_id', 'name branch_code address_line_1 address_line_2 city state pincode')
       .populate('business_id', 'name phone address')
       .populate('created_by', 'name');
 

@@ -3,6 +3,7 @@ import { DateTime } from 'luxon';
 import mongoose from 'mongoose';
 import { Order, OrderRating, OrderStatusHistory, Branch, UserBranch } from '../models.js';
 import { sessionVerification, authorizeRoles, getAccessibleBranchIds, type AuthRequest } from '../middleware/auth.js';
+import { delayedMatchCondition } from '../utils/orderDelay.js';
 
 const router = Router();
 router.use(sessionVerification);
@@ -51,7 +52,7 @@ router.get('/quickview', async (req: AuthRequest, res) => {
       Order.countDocuments(todayMatch),
       Order.aggregate([{ $match: { ...todayMatch, status: 'paid' } }, { $group: { _id: null, total: { $sum: '$total_price' } } }]),
       Order.countDocuments({ ...match, status: { $in: ['created', 'in_progress'] } }),
-      Order.countDocuments({ ...match, is_delayed: true, status: { $nin: ['paid', 'cancelled'] } }),
+      Order.countDocuments({ ...match, ...delayedMatchCondition(DateTime.now().toUTC().toISO()!) }),
       Order.countDocuments({ ...match, status: 'cancelled', createdAt: { $gte: today } }),
       Order.find(match)
         .populate('branch_id', 'name branch_code')
