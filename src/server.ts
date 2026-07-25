@@ -78,13 +78,28 @@ async function startServer() {
     next();
   });
 
-  // ─── Session (Redis) ────────────────────────────────────────────────────────
+  // ─── Session (Redis, falling back to express-session's in-memory store if
+  // Redis is unreachable — e.g. this sandbox, which has no Redis instance at all.
+  // Without this, every request touching req.session throws MaxRetriesPerRequestError
+  // once ioredis exhausts its retries, which surfaces as the frontend's AuthGuard
+  // silently bouncing back to "/" right after a successful login (500 on /auth/me,
+  // treated the same as 401). Fine for single-instance local dev; NOT safe for a
+  // real multi-instance production deployment, where Redis must actually be up.
+  // ────────────────────────────────────────────────────────────────────────────
   const sessionSecret = process.env.SESSION_SECRET;
   if (!sessionSecret) throw new Error('SESSION_SECRET environment variable must be set');
 
+  const redisReady = await Promise.race([
+    redisClient.ping().then(() => true).catch(() => false),
+    new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 2000)),
+  ]);
+  if (!redisReady) {
+    console.warn('[session] Redis unreachable — using in-memory session store instead (dev/local fallback only).');
+  }
+
   app.use(
     session({
-      store: new RedisStore({ client: redisClient as any }),
+      store: redisReady ? new RedisStore({ client: redisClient as any }) : undefined,
       secret: sessionSecret,
       resave: false,
       saveUninitialized: false,
