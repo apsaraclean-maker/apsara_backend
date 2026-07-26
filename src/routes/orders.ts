@@ -20,7 +20,7 @@ import {
 import { sessionVerification, authorizeRoles, getAccessibleBranchIds, type AuthRequest } from '../middleware/auth.js';
 import { buildWhatsAppMessage, type WhatsAppEvent } from '../services/whatsapp.js';
 import { isOrderDelayed, delayedMatchCondition } from '../utils/orderDelay.js';
-import { nowInBusinessTz } from '../utils/timezone.js';
+import { nowInBusinessTz, parseDateInBusinessTz } from '../utils/timezone.js';
 
 // True if the caller (already business-scoped by whatever lookup found `order`) is also
 // allowed to touch this specific order's branch (owners are unrestricted; managers/workers
@@ -181,8 +181,14 @@ router.get('/', async (req: AuthRequest, res) => {
     const {
       status, branch_id, start_date, end_date, search, is_delayed,
       service_id, min_price, max_price, created_by,
+      timeline_date, timeline_status,
       page = '1', limit = '20', sort = 'created_desc',
     } = req.query;
+    // Order Timeline click-through: filter to exactly the orders the clicked cell counted,
+    // instead of the broad generic date-range below (which would over-match, e.g. a paid
+    // order created on that day but paid on a different day). Mutually exclusive with the
+    // generic date-range/status path.
+    const timelineMode = !!(timeline_date && timeline_status);
     const skip = (parseInt(page as string) - 1) * parseInt(limit as string);
     // PRD: Order Quickview shows a max of 200 cards.
     const limitNum = Math.min(parseInt(limit as string) || 20, 200);
@@ -220,7 +226,35 @@ router.get('/', async (req: AuthRequest, res) => {
     // `search` via a top-level $and since both need their own $or.
     const andConditions: any[] = [];
 
-    if (start_date || end_date) {
+    if (timelineMode) {
+      // Replicate the Order Timeline cell's exact counting semantics (see
+      // dashboard.ts GET /timeline) for a single business-day so the resulting list
+      // reconciles 1:1 with the count that was clicked:
+      //   created   → created that day, not currently cancelled
+      //   order_due → due that day, not currently cancelled
+      //   completed → a 'completed' history entry that day, still completed-or-paid now
+      //   paid      → a 'paid' history entry that day, still paid now
+      //   cancelled → a 'cancelled' history entry that day (terminal)
+      const dayStart = parseDateInBusinessTz(timeline_date as string).startOf('day').toUTC().toISO()!;
+      const dayEnd = parseDateInBusinessTz(timeline_date as string).endOf('day').toUTC().toISO()!;
+      const ts = timeline_status as string;
+
+      if (ts === 'created') {
+        match.status = { $ne: 'cancelled' };
+        andConditions.push({ createdAt: { $gte: dayStart, $lte: dayEnd } });
+      } else if (ts === 'order_due') {
+        match.status = { $ne: 'cancelled' };
+        andConditions.push({ delivery_due_date: { $gte: dayStart, $lte: dayEnd } });
+      } else if (ts === 'completed' || ts === 'paid' || ts === 'cancelled') {
+        const orderIds = await OrderStatusHistory.find({
+          status: ts,
+          changed_at: { $gte: dayStart, $lte: dayEnd },
+        }).distinct('order_id');
+        andConditions.push({ _id: { $in: orderIds } });
+        if (ts === 'completed') match.status = { $in: ['completed', 'paid'] };
+        else match.status = ts; // paid → 'paid'; cancelled → 'cancelled' (terminal)
+      }
+    } else if (start_date || end_date) {
       const dateRange: any = {};
       if (start_date) dateRange.$gte = start_date as string;
       if (end_date) dateRange.$lte = `${end_date}T23:59:59.999Z`;
