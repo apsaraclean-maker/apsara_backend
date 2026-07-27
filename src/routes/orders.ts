@@ -181,7 +181,7 @@ router.get('/', async (req: AuthRequest, res) => {
     const {
       status, branch_id, start_date, end_date, search, is_delayed,
       service_id, min_price, max_price, created_by,
-      timeline_date, timeline_status,
+      timeline_date, timeline_status, include_history,
       page = '1', limit = '20', sort = 'created_desc',
     } = req.query;
     // Order Timeline click-through: filter to exactly the orders the clicked cell counted,
@@ -307,6 +307,21 @@ router.get('/', async (req: AuthRequest, res) => {
       Order.countDocuments(match),
     ]);
 
+    // Order Timeline (Calendar View) needs each order's full status history to draw its
+    // timeline bar. One bulk query for the page's orders, grouped by order_id (asc by time),
+    // instead of an N+1 per-card lookup.
+    let historyByOrder: Record<string, { status: string; changed_at: string }[]> = {};
+    if (include_history === 'true') {
+      const histories = await OrderStatusHistory.find({ order_id: { $in: orders.map((o) => o._id) } })
+        .select('order_id status changed_at')
+        .sort({ changed_at: 1 });
+      historyByOrder = histories.reduce((acc, h) => {
+        const key = String(h.order_id);
+        (acc[key] ||= []).push({ status: h.status, changed_at: h.changed_at });
+        return acc;
+      }, {} as Record<string, { status: string; changed_at: string }[]>);
+    }
+
     // Attach line items + image count + rating (PRD: Order Card shows the customer
     // rating once the order is paid and the customer has submitted one)
     const enriched = await Promise.all(
@@ -321,6 +336,7 @@ router.get('/', async (req: AuthRequest, res) => {
           items,
           image_count: imageCount,
           customer_rating: rating?.submitted_at ? rating.overall_rating : null,
+          ...(include_history === 'true' ? { status_history: historyByOrder[String(o._id)] ?? [] } : {}),
         };
       })
     );
