@@ -99,7 +99,11 @@ async function startServer() {
 
   app.use(
     session({
-      store: redisReady ? new RedisStore({ client: redisClient as any }) : undefined,
+      // connect-redis must stay on v8.x: v9 dropped its ioredis compatibility
+      // shim and issues node-redis-only `SET key val {expiration:{...}}`, which
+      // ioredis stringifies into a bogus argument → "ReplyError: ERR syntax error"
+      // on every session write (i.e. every login).
+      store: redisReady ? new RedisStore({ client: redisClient }) : undefined,
       secret: sessionSecret,
       resave: false,
       saveUninitialized: false,
