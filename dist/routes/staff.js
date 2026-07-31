@@ -16,7 +16,9 @@ const PHONE_REGEX = /^[6-9]\d{9}$/;
 function randomUnusedPasswordHash() {
     return bcrypt.hash(crypto.randomBytes(24).toString('hex'), 10);
 }
-function generateEmployeeId(name, existingIds) {
+// Also used by /auth/register-business to assign the owner their Emp. ID, so owners and
+// managers share one namespace — see takenEmployeeIds() below.
+export function generateEmployeeId(name, existingIds) {
     const initials = name
         .split(' ')
         .map((w) => w[0]?.toUpperCase() || '')
@@ -29,6 +31,22 @@ function generateEmployeeId(name, existingIds) {
         candidateId = `${initials}${counter}`;
     }
     return candidateId;
+}
+// Every Emp. ID in a business lives in one namespace enforced by the unique
+// (business_id, employee_id) index, and the owner holds one too — so the taken-ID list has
+// to span owners and managers alike. Querying managers only would let a new manager compute
+// an ID the owner already has and fail on the duplicate key.
+export async function takenEmployeeIds(businessId, excludeUserId) {
+    const query = {
+        business_id: businessId,
+        role: { $in: ['owner', 'manager'] },
+        deleted_at: null,
+        employee_id: { $ne: null },
+    };
+    if (excludeUserId)
+        query._id = { $ne: excludeUserId };
+    const users = await User.find(query).select('employee_id');
+    return users.map((u) => u.employee_id);
 }
 // GET /api/staff — viewable by all roles (owner/manager/worker); PIN is only ever
 // attached in the response for the owner (see enrichment below).
@@ -102,14 +120,7 @@ router.post('/', authorizeRoles('owner'), async (req, res) => {
         const pin_encrypted = encryptPin(String(pin));
         let employee_id = null;
         if (role === 'manager') {
-            const existingManagers = await User.find({
-                business_id: req.user.businessId,
-                role: 'manager',
-                deleted_at: null,
-                employee_id: { $ne: null },
-            }).select('employee_id');
-            const existingIds = existingManagers.map((m) => m.employee_id);
-            employee_id = generateEmployeeId(name, existingIds);
+            employee_id = generateEmployeeId(name, await takenEmployeeIds(req.user.businessId));
         }
         const staff = await User.create({
             business_id: req.user.businessId,
@@ -176,15 +187,7 @@ router.put('/:id', authorizeRoles('owner'), async (req, res) => {
         if (role && role !== staff.role) {
             staff.role = role;
             if (role === 'manager' && !staff.employee_id) {
-                const existingManagers = await User.find({
-                    business_id: req.user.businessId,
-                    role: 'manager',
-                    deleted_at: null,
-                    employee_id: { $ne: null },
-                    _id: { $ne: staff._id },
-                }).select('employee_id');
-                const existingIds = existingManagers.map((m) => m.employee_id);
-                staff.employee_id = generateEmployeeId(staff.name, existingIds);
+                staff.employee_id = generateEmployeeId(staff.name, await takenEmployeeIds(req.user.businessId, staff._id));
             }
             else if (role === 'worker') {
                 staff.employee_id = null;
