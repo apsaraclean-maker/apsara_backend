@@ -5,8 +5,9 @@ import crypto from 'crypto';
 import { DateTime } from 'luxon';
 import { User, Business, Branch, ActiveSession, OTP } from '../models.js';
 import { generateToken, sessionVerification } from '../middleware/auth.js';
-import { decryptPin } from '../utils/pinCrypto.js';
+import { decryptPin, encryptPin, generatePin } from '../utils/pinCrypto.js';
 import { generateBranchCode } from './branches.js';
+import { generateEmployeeId } from './staff.js';
 import { deriveDeviceLabel } from '../utils/deviceLabel.js';
 const router = Router();
 const MAX_FAILED_ATTEMPTS = 10;
@@ -55,7 +56,11 @@ router.post('/register-business', async (req, res) => {
             phone,
             password_hash,
             role: 'owner',
-            employee_id: 'OWN',
+            // The Business Page shows every persona their own Emp. ID and PIN, so the owner is
+            // assigned one too. It is generated rather than chosen because there is nobody to
+            // set it for them. This is display-only: verifyCredential() above authenticates
+            // owners by password, so an owner PIN opens no login path.
+            pin_encrypted: encryptPin(generatePin()),
             is_active: true,
         });
         const business = await Business.create({
@@ -68,6 +73,13 @@ router.post('/register-business', async (req, res) => {
             status: 'active',
         });
         owner.business_id = business._id;
+        // Derived from the owner's name, exactly like a manager's (Anshul Prajapati -> AP0).
+        // Assigned only now that business_id is set: the unique (business_id, employee_id)
+        // index scopes IDs per business, so computing one while business_id was still null
+        // put every owner on the platform on the same (null, ...) key — the second business
+        // to register would have failed on a duplicate key. The business is new, so nothing
+        // else holds an ID yet.
+        owner.employee_id = generateEmployeeId(ownerName, []);
         await owner.save();
         // A business must always have at least one branch (nothing else in the app — orders,
         // services, staff assignments — works without one), so registration creates a default
@@ -232,7 +244,11 @@ router.get('/me', sessionVerification, async (req, res) => {
         const user = await User.findOne({ _id: req.user.id, is_active: true, deleted_at: null }).select('-password_hash -pin_encrypted');
         if (!user)
             return res.status(404).json({ message: 'User not found' });
-        res.json(user);
+        // The platform header shows the business name next to the Apsara mark on every page,
+        // so it rides along here rather than costing a separate request per page load.
+        // Appended as a scalar instead of populating business_id, which callers use as an id.
+        const business = user.business_id ? await Business.findById(user.business_id).select('name') : null;
+        res.json({ ...user.toObject(), business_name: business?.name || '' });
     }
     catch (err) {
         res.status(500).json({ message: err.message });

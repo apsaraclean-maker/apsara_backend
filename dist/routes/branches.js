@@ -1,6 +1,7 @@
 import { Router } from 'express';
+import mongoose from 'mongoose';
 import { DateTime } from 'luxon';
-import { Branch, BranchService, UserBranch, Service, User, Order } from '../models.js';
+import { Branch, BranchService, UserBranch, Service, User, Order, OrderRating } from '../models.js';
 import { sessionVerification, authorizeRoles, getAccessibleBranchIds } from '../middleware/auth.js';
 import { nowInBusinessTz } from '../utils/timezone.js';
 const router = Router();
@@ -93,7 +94,7 @@ router.get('/', async (req, res) => {
         // createdAt window + current status rather than a point-in-time history join).
         const monthStart = nowInBusinessTz().startOf('month').toUTC().toISO();
         const enriched = await Promise.all(branches.map(async (b) => {
-            const [serviceCount, staffCount, revenueAgg, orderCount] = await Promise.all([
+            const [serviceCount, staffCount, revenueAgg, orderCount, ratingAgg] = await Promise.all([
                 BranchService.countDocuments({ branch_id: b._id }),
                 UserBranch.countDocuments({ branch_id: b._id }),
                 Order.aggregate([
@@ -101,6 +102,12 @@ router.get('/', async (req, res) => {
                     { $group: { _id: null, total: { $sum: '$total_price' } } },
                 ]),
                 Order.countDocuments({ branch_id: b._id, deleted_at: null, createdAt: { $gte: monthStart } }),
+                OrderRating.aggregate([
+                    { $lookup: { from: 'orders', localField: 'order_id', foreignField: '_id', as: 'order' } },
+                    { $unwind: '$order' },
+                    { $match: { 'order.branch_id': new mongoose.Types.ObjectId(b._id), submitted_at: { $ne: null } } },
+                    { $group: { _id: null, avg: { $avg: '$overall_rating' } } },
+                ]),
             ]);
             return {
                 ...b.toObject(),
@@ -108,6 +115,7 @@ router.get('/', async (req, res) => {
                 staff_count: staffCount,
                 monthly_revenue: revenueAgg[0]?.total || 0,
                 monthly_orders: orderCount,
+                rating: ratingAgg[0]?.avg ? Math.round(ratingAgg[0].avg * 10) / 10 : null,
             };
         }));
         res.json(enriched);
