@@ -9,6 +9,13 @@ if (!KEY_HEX || KEY_HEX.length !== 64) {
 }
 const KEY = Buffer.from(KEY_HEX, 'hex');
 
+// Owners aren't given a PIN by anyone the way staff are, but the Business Page still shows
+// them one, so it's generated. 5 digits, cryptographically random, matching the length the
+// design uses and staying inside the 4-6 digit range PIN_REGEX accepts.
+export function generatePin(): string {
+  return String(10000 + crypto.randomInt(90000));
+}
+
 export function encryptPin(pin: string): string {
   const iv = crypto.randomBytes(12);
   const cipher = crypto.createCipheriv('aes-256-gcm', KEY, iv);

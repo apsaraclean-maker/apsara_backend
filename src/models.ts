@@ -14,7 +14,13 @@ export type BusinessStatus = 'active' | 'inactive' | 'blocked';
 const businessSchema = new mongoose.Schema({
   name: { type: String, required: true },
   gst_number: { type: String, default: '' },
+  // social_link predates the Business Page design, which splits the socials into three
+  // named links (Figma node 860:20114). It is kept as the Website fallback for businesses
+  // created before `website` existed.
   social_link: { type: String, default: '' },
+  website: { type: String, default: '' },
+  facebook_url: { type: String, default: '' },
+  instagram_url: { type: String, default: '' },
   owner_id: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
   overall_rating_cache: { type: Number, default: 0 },
   status: { type: String, enum: ['active', 'inactive', 'blocked'], default: 'active' },

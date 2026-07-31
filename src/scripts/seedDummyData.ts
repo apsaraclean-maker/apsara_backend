@@ -21,7 +21,7 @@ import {
   Business, User, Branch, BranchService, UserBranch, Service, Article, WashingMethod,
   Order, OrderService, OrderStatusHistory, OrderRating, OrderDailyCounter,
 } from '../models.js';
-import { encryptPin } from '../utils/pinCrypto.js';
+import { encryptPin, generatePin } from '../utils/pinCrypto.js';
 import { nowInBusinessTz } from '../utils/timezone.js';
 
 // ─── Small helpers ──────────────────────────────────────────────────────────────
@@ -164,7 +164,7 @@ async function seedOneBusiness(template: typeof BUSINESS_TEMPLATES[number], home
     phone: ownerPhone,
     password_hash: ownerPasswordHash,
     role: 'owner',
-    employee_id: 'OWN',
+    pin_encrypted: encryptPin(generatePin()),
     is_active: true,
   });
 
@@ -180,6 +180,9 @@ async function seedOneBusiness(template: typeof BUSINESS_TEMPLATES[number], home
     status: 'active',
   });
   owner.business_id = business._id as any;
+  // Matches register-business: name-derived, and assigned only once business_id is set so
+  // the unique (business_id, employee_id) index scopes it per business.
+  owner.employee_id = generateEmployeeId(owner.name, []);
   await owner.save();
 
   // ── Branches ──
@@ -210,7 +213,9 @@ async function seedOneBusiness(template: typeof BUSINESS_TEMPLATES[number], home
   // ── Staff (5-8): 1-2 managers, rest workers ──
   const staffCount = randomInt(5, 8);
   const managerCount = randomInt(1, 2);
-  const managerEmpIds: string[] = [];
+  // Seeded with the owner's ID — owners and managers share one Emp. ID namespace, so a
+  // manager computing against an empty list could land on the ID the owner already holds.
+  const managerEmpIds: string[] = [owner.employee_id as string];
   const staff = [];
   for (let i = 0; i < staffCount; i++) {
     const role = i < managerCount ? 'manager' : 'worker';
