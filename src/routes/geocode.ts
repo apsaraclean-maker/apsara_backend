@@ -37,7 +37,9 @@ router.get('/reverse', async (req, res) => {
 });
 
 // GET /api/geocode/search?q= — forward geocoding for the map picker's address search box
-// (jump the map to a typed address rather than only allowing click-to-place).
+// (jump the map to a typed address rather than only allowing click-to-place). The parsed
+// address parts ride along so the Create Branch page's City / Pincode suggestion dropdowns
+// (PRD "Data Size/Limit") can reuse this one endpoint instead of needing their own.
 router.get('/search', async (req, res) => {
   const { q } = req.query;
   if (!q) return res.status(400).json({ message: 'q is required' });
@@ -49,11 +51,17 @@ router.get('/search', async (req, res) => {
     });
 
     res.json(
-      (response.data || []).map((r: any) => ({
-        display_name: r.display_name,
-        lat: parseFloat(r.lat),
-        lng: parseFloat(r.lon),
-      }))
+      (response.data || []).map((r: any) => {
+        const addr = r.address || {};
+        return {
+          display_name: r.display_name,
+          lat: parseFloat(r.lat),
+          lng: parseFloat(r.lon),
+          city: addr.city || addr.town || addr.village || addr.county || '',
+          state: addr.state || '',
+          pincode: addr.postcode || '',
+        };
+      })
     );
   } catch (err: any) {
     res.status(502).json({ message: 'Geocode search failed' });
