@@ -85,7 +85,15 @@ router.get('/quickview', async (req: AuthRequest, res) => {
 //   - completed: orders with a 'completed' history entry that day, but only if the order
 //                hasn't since reverted below completed (current status is completed/paid)
 //   - paid:      orders with a 'paid' history entry that day, only if still currently paid
-//   - cancelled: orders with a 'cancelled' history entry that day (terminal, no reversal)
+//   - cancelled: orders cancelled that day, only if still cancelled — cancelling is
+//                reversible (isValidStatusTransition permits cancelled → created), so a
+//                reopened order must drop out of this row the way it drops back into
+//                'created'. Otherwise it is counted in two places at once.
+//
+// Every row therefore reflects the order's current state. Status history is append-only and
+// an order can reach the same status more than once (completed → in_progress → completed),
+// so entries are reduced to the latest one per order and status before counting; without
+// that, one order stepped back and finished again is counted twice.
 router.get('/timeline', async (req: AuthRequest, res) => {
   try {
     const { branch_id, start_date, end_date, days: daysParam } = req.query;
@@ -148,7 +156,16 @@ router.get('/timeline', async (req: AuthRequest, res) => {
             ...(match.branch_id !== undefined ? { 'order.branch_id': match.branch_id } : {}),
           },
         },
-        { $project: { status: 1, changed_at: 1, current_status: '$order.status' } },
+        // Latest visit per order and status, so a repeated transition counts once.
+        { $sort: { changed_at: -1 } },
+        {
+          $group: {
+            _id: { order_id: '$order_id', status: '$status' },
+            status: { $first: '$status' },
+            changed_at: { $first: '$changed_at' },
+            current_status: { $first: '$order.status' },
+          },
+        },
       ]),
     ]);
 
@@ -167,7 +184,7 @@ router.get('/timeline', async (req: AuthRequest, res) => {
       if (!matrix[d]) continue;
       if (h.status === 'completed' && ['completed', 'paid'].includes(h.current_status)) matrix[d].completed++;
       else if (h.status === 'paid' && h.current_status === 'paid') matrix[d].paid++;
-      else if (h.status === 'cancelled') matrix[d].cancelled++;
+      else if (h.status === 'cancelled' && h.current_status === 'cancelled') matrix[d].cancelled++;
     }
 
     res.json({ dates, statuses, matrix, today: nowInBusinessTz().toFormat('yyyy-MM-dd') });
