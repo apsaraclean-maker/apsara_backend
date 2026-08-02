@@ -568,6 +568,10 @@ router.patch('/:id/status', authorizeRoles('owner', 'manager'), async (req: Auth
 
     const prev_status = order.status;
     order.status = status;
+    // Reaching "completed" is what the delay rule is measured against, so the moment is
+    // recorded here. Going straight created → paid isn't a legal transition, so `paid`
+    // always arrives with completed_at already set.
+    if (status === 'completed') order.completed_at = DateTime.now().toUTC().toISO()!;
     order.updatedAt = DateTime.now().toUTC().toISO()!;
     await order.save();
 

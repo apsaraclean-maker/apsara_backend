@@ -146,6 +146,11 @@ const orderSchema = new mongoose.Schema({
   customer_mobile: { type: String, default: '' },
   status: { type: String, enum: ['created', 'in_progress', 'completed', 'paid', 'cancelled'], default: 'created' },
   delivery_due_date: { type: String, default: null },
+  // When the order last reached "completed". Delay is judged against this rather than
+  // against the clock, so an order that missed its due date stays marked as delayed once
+  // it's finished — see utils/orderDelay.ts. Stamped on every entry into `completed`, so
+  // stepping back to in_progress and finishing again records the later, real completion.
+  completed_at: { type: String, default: null },
   extra_charges: { type: Number, default: 0 },
   extra_charges_reason: { type: String, default: '' },
   total_price: { type: Number, required: true },
