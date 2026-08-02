@@ -10,10 +10,25 @@ router.use(sessionVerification);
 // GET /api/services
 router.get('/', async (req: AuthRequest, res) => {
   try {
-    const { search, branch_id, active_only } = req.query;
+    const { search, branch_id, active_only, is_active, article_type, washing_method, min_price, max_price } = req.query;
 
     const query: any = { business_id: req.user!.businessId, deleted_at: null };
     if (active_only === 'true') query.is_active = true;
+    // Services Page filter panel. `is_active` is the tri-state one the panel drives
+    // (all / active / inactive); `active_only` above stays for the callers that just want
+    // the live catalogue.
+    if (is_active === 'true' || is_active === 'false') query.is_active = is_active === 'true';
+    if (article_type) query.article_type = article_type;
+    if (washing_method) query.washing_method = washing_method;
+
+    // Price range spans both rate fields: a service matches if either the per-piece or the
+    // per-kg rate falls in the range, since a service may only carry one of them.
+    const priceBound: any = {};
+    if (min_price) priceBound.$gte = Number(min_price);
+    if (max_price) priceBound.$lte = Number(max_price);
+    if (Object.keys(priceBound).length) {
+      query.$and = [{ $or: [{ unit_price: priceBound }, { weight_price: priceBound }] }];
+    }
 
     if (search) {
       const escaped = (search as string).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
