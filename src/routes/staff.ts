@@ -58,10 +58,21 @@ export async function takenEmployeeIds(businessId: unknown, excludeUserId?: unkn
 // attached in the response for the owner (see enrichment below).
 router.get('/', async (req: AuthRequest, res) => {
   try {
-    const { branch_id, role, search } = req.query;
+    const { branch_id, role, search, is_active } = req.query;
 
-    const query: any = { business_id: req.user!.businessId, deleted_at: null, role: { $in: ['manager', 'worker'] } };
-    if (role) query.role = role;
+    // The Staff Page lists managers and workers. `role` narrows that, and also accepts a
+    // comma-separated list — the Orders filter's "Created By" asks for `owner,manager`,
+    // since those are the only roles that can create an order (PRD persona rules), and the
+    // owner would otherwise be missing from a list of people who created orders.
+    const requestedRoles = role ? String(role).split(',').map((r) => r.trim()).filter(Boolean) : null;
+    const allowedRoles = requestedRoles ?? ['manager', 'worker'];
+    const query: any = {
+      business_id: req.user!.businessId,
+      deleted_at: null,
+      role: { $in: allowedRoles.filter((r) => ['owner', 'manager', 'worker'].includes(r)) },
+    };
+    // Staff Page filter panel's tri-state status (all / active / inactive).
+    if (is_active === 'true' || is_active === 'false') query.is_active = is_active === 'true';
     if (search) {
       const re = new RegExp(String(search), 'i');
       query.$or = [{ name: re }, { phone: re }];

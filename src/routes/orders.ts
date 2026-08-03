@@ -93,8 +93,10 @@ router.get('/rate/:token', async (req, res) => {
     // browsable (and rateable) indefinitely. Reuses the same "not found or expired" message
     // as a missing token so a deleted order isn't distinguishable from a bad link.
     const order = await Order.findOne({ _id: rating.order_id, deleted_at: null })
-      .populate('branch_id', 'name')
-      .populate('business_id', 'name');
+      .populate('branch_id', 'name address_line_1 address_line_2 city state pincode')
+      // The invoice header prints the shop's address and phone under its name, so the
+      // whole block travels with the order rather than just the name.
+      .populate('business_id', 'name address state pincode phone');
     if (!order) return res.status(404).json({ message: 'Rating link not found or expired' });
 
     const items = await OrderService.find({ order_id: order._id });
@@ -351,8 +353,12 @@ router.get('/', async (req: AuthRequest, res) => {
 router.get('/:id', async (req: AuthRequest, res) => {
   try {
     const order = await Order.findOne({ _id: req.params.id, business_id: req.user!.businessId, deleted_at: null })
-      .populate('branch_id', 'name branch_code')
-      .populate('created_by', 'name role employee_id');
+      // The invoice prints the branch that handled the order, and its address, beneath the
+      // business name — so the branch's address fields travel with the order too.
+      .populate('branch_id', 'name branch_code address_line_1 address_line_2 city state pincode')
+      .populate('created_by', 'name role employee_id')
+      // Needed by the invoice the Order Detail page can download once the order is paid.
+      .populate('business_id', 'name address state pincode phone');
 
     if (!order) return res.status(404).json({ message: 'Order not found' });
     if (!(await hasOrderBranchAccess(req.user, order))) {
