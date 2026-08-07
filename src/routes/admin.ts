@@ -3,6 +3,7 @@ import bcrypt from 'bcryptjs';
 import { DateTime } from 'luxon';
 import { Business, User, Payment, AdminUser } from '../models.js';
 import { generateAdminToken, adminAuthMiddleware, type AuthRequest } from '../middleware/auth.js';
+import { invalidateUserSessions } from '../utils/sessionControl.js';
 
 const router = Router();
 
@@ -47,7 +48,7 @@ router.get('/businesses', adminAuthMiddleware, async (_req, res) => {
 
     const result = await Promise.all(
       businesses.map(async (biz) => {
-        const owner = await User.findById(biz.owner_id).select('name phone');
+        const owner = await User.findById(biz.owner_id).select('name phone is_active failed_login_count');
         let paymentLabel = 'N/A';
 
         if (biz.status === 'active') {
@@ -67,6 +68,11 @@ router.get('/businesses', adminAuthMiddleware, async (_req, res) => {
           createdAt: biz.createdAt,
           owner_name: owner?.name || '',
           owner_phone: owner?.phone || '',
+          // Surfaced so support can see and clear an owner auto-disabled by the failed-login
+          // escalation in auth.ts — an owner has nobody above them to flip the toggle, so
+          // this panel is the only way back in.
+          owner_id: owner?._id || null,
+          owner_is_active: owner?.is_active ?? true,
           payment_label: paymentLabel,
         };
       })
@@ -114,6 +120,47 @@ router.patch('/businesses/:id/status', adminAuthMiddleware, async (req, res) => 
     await business.save();
 
     res.json({ message: `Business ${business.status}`, business });
+  } catch (err: any) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// PATCH /api/admin/users/:id/status — reactivate (or disable) an individual user account.
+//
+// Exists for one case the app otherwise cannot recover from: an owner who fails login 30
+// times is disabled by the escalation in auth.ts, and unlike staff — whom their owner can
+// re-enable from the Staff page — an owner has no one above them. Without this endpoint the
+// only route back is editing the database by hand.
+router.patch('/users/:id/status', adminAuthMiddleware, async (req, res) => {
+  const { is_active } = req.body;
+  if (typeof is_active !== 'boolean') {
+    return res.status(400).json({ message: 'is_active must be true or false' });
+  }
+  try {
+    const user = await User.findOne({ _id: req.params.id, deleted_at: null });
+    if (!user) return res.status(404).json({ message: 'User not found' });
+
+    // Reactivating must clear the counters as well as the flag. The disabled account still
+    // carries failed_login_count at 30, so leaving it would let the very next mistyped
+    // password disable them again immediately.
+    if (is_active) {
+      user.failed_login_count = 0;
+      user.locked_until = null;
+    }
+    user.is_active = is_active;
+    user.updatedAt = DateTime.now().toUTC().toISO()!;
+    await user.save();
+
+    // Disabling has to end any session they still hold rather than wait for the cookie to
+    // expire. (This admin app authenticates with its own bearer token and has no
+    // express-session store attached, hence no store argument — bumping session_epoch is
+    // what actually invalidates them; the store destroy is only cleanup.)
+    if (!is_active) await invalidateUserSessions(user._id);
+
+    res.json({
+      message: is_active ? 'Account reactivated' : 'Account disabled',
+      user: { id: user._id, name: user.name, phone: user.phone, role: user.role, is_active: user.is_active },
+    });
   } catch (err: any) {
     res.status(500).json({ message: err.message });
   }

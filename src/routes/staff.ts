@@ -6,6 +6,8 @@ import mongoose from 'mongoose';
 import { User, UserBranch, ArchivedUser } from '../models.js';
 import { sessionVerification, authorizeRoles, type AuthRequest } from '../middleware/auth.js';
 import { encryptPin, decryptPin } from '../utils/pinCrypto.js';
+import { buildSearchRegex } from '../utils/searchRegex.js';
+import { invalidateUserSessions } from '../utils/sessionControl.js';
 
 const router = Router();
 router.use(sessionVerification);
@@ -73,8 +75,8 @@ router.get('/', async (req: AuthRequest, res) => {
     };
     // Staff Page filter panel's tri-state status (all / active / inactive).
     if (is_active === 'true' || is_active === 'false') query.is_active = is_active === 'true';
-    if (search) {
-      const re = new RegExp(String(search), 'i');
+    const re = buildSearchRegex(search);
+    if (re) {
       query.$or = [{ name: re }, { phone: re }];
     }
 
@@ -200,7 +202,21 @@ router.put('/:id', authorizeRoles('owner'), async (req: AuthRequest, res) => {
       staff.phone = phone;
     }
     if (pin) staff.pin_encrypted = encryptPin(String(pin));
-    if (is_active !== undefined) staff.is_active = is_active;
+
+    // Re-enabling has to clear the lockout state too. The escalation in auth.ts leaves a
+    // disabled account with failed_login_count at 30 and, without this, the owner flips the
+    // toggle back on only for the member's next mistyped PIN to disable them again instantly.
+    if (is_active !== undefined) {
+      if (is_active === true && !staff.is_active) {
+        staff.failed_login_count = 0;
+        staff.locked_until = null;
+      }
+      staff.is_active = is_active;
+    }
+
+    // Anything that changes what this person can do, or how they authenticate, must end
+    // their existing sessions rather than wait up to 7 days for the cookie to expire.
+    const mustReauthenticate = (!!role && role !== staff.role) || !!pin || is_active === false;
 
     // Handle role change + employee ID
     if (role && role !== staff.role) {
@@ -223,6 +239,11 @@ router.put('/:id', authorizeRoles('owner'), async (req: AuthRequest, res) => {
       if (branch_ids.length) {
         await UserBranch.insertMany(branch_ids.map((bid: string) => ({ user_id: staff._id, branch_id: bid })));
       }
+    }
+
+    // After the save, so a failed write can't sign someone out for a change that never landed.
+    if (mustReauthenticate) {
+      await invalidateUserSessions(staff._id, req.sessionStore);
     }
 
     res.json({
@@ -260,6 +281,10 @@ router.delete('/:id', authorizeRoles('owner'), async (req: AuthRequest, res) => 
     await staff.save();
 
     await UserBranch.deleteMany({ user_id: staff._id });
+    // sessionVerification already rejects a soft-deleted user on their next request, so this
+    // is mainly to clear their ActiveSession rows rather than leave them counting against the
+    // device limit until the 7-day TTL.
+    await invalidateUserSessions(staff._id, req.sessionStore);
 
     res.json({ message: 'Staff removed successfully' });
   } catch (err: any) {

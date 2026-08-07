@@ -3,6 +3,7 @@ import dns from 'dns';
 dns.setDefaultResultOrder('ipv4first');
 
 import express from 'express';
+import helmet from 'helmet';
 import session from 'express-session';
 import { RedisStore } from 'connect-redis';
 import mongoose from 'mongoose';
@@ -12,6 +13,7 @@ import fs from 'fs';
 import { fileURLToPath } from 'url';
 import cron from 'node-cron';
 
+import { rejectQueryOperators } from './middleware/sanitize.js';
 import { redisClient } from './config/redis.js';
 import { seedDatabase } from './config/seed.js';
 import { purgeExpiredSoftDeletes } from './config/purge.js';
@@ -61,8 +63,34 @@ async function startServer() {
   if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir, { recursive: true });
 
   app.set('trust proxy', 1);
+
+  // ─── Security headers ───────────────────────────────────────────────────────
+  // Mounted before anything else so every response carries them, including errors.
+  //
+  // crossOriginResourcePolicy is the one setting that must be changed from helmet's
+  // default: it ships as 'same-origin', which would immediately stop the frontend from
+  // loading order images, since the web app and this API are on different origins by
+  // design. CORS (below) is what actually governs who may call this API — CORP would only
+  // break the image tags.
+  //
+  // HSTS is production-only: it instructs browsers to refuse plain HTTP for this host,
+  // which is correct behind the TLS terminator and merely confusing on a local http server.
+  app.use(
+    helmet({
+      crossOriginResourcePolicy: { policy: 'cross-origin' },
+      frameguard: { action: 'deny' },
+      referrerPolicy: { policy: 'strict-origin-when-cross-origin' },
+      hsts: process.env.NODE_ENV === 'production'
+        ? { maxAge: 15552000, includeSubDomains: true }
+        : false,
+    })
+  );
+
   app.use(express.json({ limit: '10mb' }));
   app.use(cookieParser());
+  // Runs after the body parser (so req.body is populated) and before any route, so no
+  // handler can be reached with an operator-shaped field name in its payload.
+  app.use(rejectQueryOperators);
   // nosniff: uploaded order images are validated by extension+mimetype, not real content
   // sniffing, so this stops a browser from re-interpreting a served file as something other
   // than its declared type.

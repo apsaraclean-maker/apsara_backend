@@ -15,6 +15,7 @@
     "dotenv": "^17.2.3",
     "express": "^4.21.2",
     "express-session": "^1.19.0",
+    "helmet": "^8.3.0",
     "ioredis": "^5.11.1",
     "jsonwebtoken": "^9.0.3",
     "luxon": "^3.7.2",

@@ -46,6 +46,20 @@ export const sessionVerification = async (req: AuthRequest, res: Response, next:
       return res.status(401).json({ message: 'Access denied' });
     }
 
+    // Any change that must take effect immediately (role change, PIN change, disable) bumps
+    // the user's session_epoch — see invalidateUserSessions(). A session minted before that
+    // bump is stale and dies here rather than living on until its 7-day cookie expires.
+    // Both sides default to 0 so sessions already in flight when this shipped stay valid —
+    // they predate the field and would otherwise all be logged out at deploy. To force a
+    // global re-login deliberately, bump every user's session_epoch by one.
+    const sessionEpoch = (req.session as any).epoch ?? 0;
+    if (sessionEpoch !== (user.session_epoch ?? 0)) {
+      return res.status(401).json({
+        code: 'PERMISSIONS_CHANGED',
+        message: 'Your access has been updated. Please log in again.',
+      });
+    }
+
     if (user.business_id) {
       const business = await Business.findById(user.business_id);
       if (business && business.status !== 'active') {
@@ -53,7 +67,11 @@ export const sessionVerification = async (req: AuthRequest, res: Response, next:
       }
     }
 
-    req.user = { id: decoded.id, role: decoded.role, businessId: decoded.businessId };
+    // Role and business come from the record we just loaded, NOT from the token. The token is
+    // signed once at login and never changes, so reading `decoded.role` here left a demoted
+    // user holding their old powers until the session expired — up to 7 days. Every
+    // authorizeRoles() check downstream depends on this being the live value.
+    req.user = { id: decoded.id, role: user.role as UserRole, businessId: user.business_id ? String(user.business_id) : undefined };
     next();
   } catch {
     return res.status(401).json({ message: 'Invalid session token' });

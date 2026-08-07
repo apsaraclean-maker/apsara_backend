@@ -2,6 +2,7 @@ import { Router } from 'express';
 import bcrypt from 'bcryptjs';
 import axios from 'axios';
 import crypto from 'crypto';
+import mongoose from 'mongoose';
 import { DateTime } from 'luxon';
 import { User, Business, Branch, ActiveSession, OTP } from '../models.js';
 import { generateToken, sessionVerification, type AuthRequest } from '../middleware/auth.js';
@@ -9,11 +10,13 @@ import { decryptPin, encryptPin, generatePin } from '../utils/pinCrypto.js';
 import { generateBranchCode } from './branches.js';
 import { generateEmployeeId } from './staff.js';
 import { deriveDeviceLabel } from '../utils/deviceLabel.js';
+import { invalidateUserSessions } from '../utils/sessionControl.js';
 
 const router = Router();
 
-const MAX_FAILED_ATTEMPTS = 10;
-const LOCKOUT_MINUTES = 120;
+const MAX_FAILED_ATTEMPTS = 10;   // wrong guesses per lockout cycle
+const LOCKOUT_MINUTES = 120;      // cooldown served at 10 and at 20
+const DISABLE_AFTER_ATTEMPTS = 30; // third cycle disables the account outright
 const MAX_CONCURRENT_SESSIONS = 3;
 
 // Owners/admins authenticate with their password; managers/workers with their PIN (PIN
@@ -26,6 +29,156 @@ async function verifyCredential(user: InstanceType<typeof User>, password: strin
     return bcrypt.compare(password, user.password_hash);
   }
   return !!user.pin_encrypted && decryptPin(user.pin_encrypted) === password;
+}
+
+// ─── Shared credential check ──────────────────────────────────────────────────
+// Both /login and /revoke-session authenticate the same way, so they must also throttle the
+// same way. They previously didn't: /revoke-session ran verifyCredential directly with no
+// lockout check, no attempt counting and no CAPTCHA, which made every protection on /login
+// bypassable by simply knocking on the other door. Since staff authenticate with a 5-digit
+// PIN (~90k possibilities), an unthrottled endpoint is enough to walk the whole keyspace.
+// Everything below therefore lives in one function that both routes are required to go
+// through, rather than being duplicated per-route where it can drift out of sync again.
+
+type LoginFailure = { status: number; body: Record<string, unknown> };
+type LoginOutcome =
+  | { ok: true; user: InstanceType<typeof User> }
+  | { ok: false; failure: LoginFailure };
+
+// One message for "no such account" and "wrong credential" alike. Returning 404 for an
+// unknown phone number let anyone test which numbers have accounts just by watching the
+// status code.
+const INVALID_CREDENTIALS: LoginFailure = {
+  status: 400,
+  body: { code: 'INVALID_CREDENTIALS', message: 'Account or Password may be incorrect.' },
+};
+
+// The lockout and disabled responses below do still confirm that an account exists — that's
+// a deliberate trade. This userbase is not tech-savvy, and a locked-out worker who is told
+// only "Account or Password may be incorrect" has no way to understand why the right PIN
+// stopped working or what to do next. Making these generic too would need decoy counters for
+// phone numbers that don't exist, and would cost exactly the guidance they're here to give.
+function accountDisabled(role: string): LoginFailure {
+  const isOwner = role === 'owner' || role === 'admin';
+  return {
+    status: 403,
+    body: {
+      code: isOwner ? 'ACCOUNT_DISABLED_OWNER' : 'ACCOUNT_DISABLED_STAFF',
+      message: isOwner
+        ? 'Your account has been disabled after too many failed login attempts. Please contact Apsara support to reactivate it.'
+        : 'Your account has been disabled after too many failed login attempts. Please ask your business owner to reactivate it from the Staff page.',
+    },
+  };
+}
+
+/**
+ * Resolves a phone + credential pair, applying the full lockout/disable escalation:
+ * 10 wrong guesses → 2h cooldown, 20 → another 2h, 30 → account disabled.
+ *
+ * `failed_login_count` is cumulative and is deliberately not cleared when a cooldown
+ * expires — clearing it there (as this used to) meant the count reset to zero every two
+ * hours and could never reach the disable threshold.
+ */
+async function verifyLogin(phone: unknown, password: unknown, store?: any): Promise<LoginOutcome> {
+  // Typed guards, not just for safety: an object here would otherwise reach the Mongoose
+  // filter below as a query operator. See middleware/sanitize.ts for the general defence —
+  // this is the second layer on the one lookup where it matters most.
+  if (typeof phone !== 'string' || typeof password !== 'string') {
+    return { ok: false, failure: INVALID_CREDENTIALS };
+  }
+
+  const user = await User.findOne({ phone, deleted_at: null });
+  if (!user) return { ok: false, failure: INVALID_CREDENTIALS };
+
+  if (user.locked_until) {
+    const lockedUntil = DateTime.fromISO(user.locked_until);
+    if (DateTime.now().toUTC() < lockedUntil) {
+      const minutesLeft = Math.ceil(lockedUntil.diffNow('minutes').minutes);
+      return {
+        ok: false,
+        failure: {
+          status: 403,
+          body: {
+            code: 'ACCOUNT_LOCKED',
+            message: `Account locked. Try again in ${minutesLeft} minute(s).`,
+            locked_until: user.locked_until,
+            minutes_remaining: minutesLeft,
+          },
+        },
+      };
+    }
+    // Cooldown served. Release the lock but keep the running count.
+    user.locked_until = null;
+  }
+
+  if (!user.is_active) {
+    return { ok: false, failure: accountDisabled(user.role) };
+  }
+
+  if (user.business_id) {
+    const business = await Business.findById(user.business_id);
+    if (business && business.status !== 'active') {
+      return {
+        ok: false,
+        failure: {
+          status: 403,
+          body: {
+            code: 'BUSINESS_PAUSED',
+            message: 'This account has been paused. Please contact Apsara support.',
+          },
+        },
+      };
+    }
+  }
+
+  if (await verifyCredential(user, password)) {
+    user.failed_login_count = 0;
+    user.locked_until = null;
+    await user.save();
+    return { ok: true, user };
+  }
+
+  user.failed_login_count = (user.failed_login_count || 0) + 1;
+
+  if (user.failed_login_count >= DISABLE_AFTER_ATTEMPTS) {
+    user.is_active = false;
+    user.locked_until = null; // disabled supersedes any cooldown
+    await user.save();
+    // They may still be signed in on another device — being disabled has to end that too.
+    await invalidateUserSessions(user._id, store);
+    return { ok: false, failure: accountDisabled(user.role) };
+  }
+
+  if (user.failed_login_count % MAX_FAILED_ATTEMPTS === 0) {
+    user.locked_until = DateTime.now().toUTC().plus({ minutes: LOCKOUT_MINUTES }).toISO();
+    await user.save();
+    const cyclesLeft = (DISABLE_AFTER_ATTEMPTS - user.failed_login_count) / MAX_FAILED_ATTEMPTS;
+    return {
+      ok: false,
+      failure: {
+        status: 403,
+        body: {
+          code: 'ACCOUNT_LOCKED',
+          message: `Too many failed attempts. Account locked for ${LOCKOUT_MINUTES} minutes.`
+            + ` ${cyclesLeft} more lockout(s) will disable this account.`,
+          locked_until: user.locked_until,
+          minutes_remaining: LOCKOUT_MINUTES,
+        },
+      },
+    };
+  }
+
+  await user.save();
+  return {
+    ok: false,
+    failure: {
+      status: INVALID_CREDENTIALS.status,
+      body: {
+        ...INVALID_CREDENTIALS.body,
+        attempts_remaining: MAX_FAILED_ATTEMPTS - (user.failed_login_count % MAX_FAILED_ATTEMPTS),
+      },
+    },
+  };
 }
 
 async function verifyRecaptcha(token: string): Promise<boolean> {
@@ -106,6 +259,7 @@ router.post('/register-business', async (req, res) => {
     const token = generateToken({ id: owner._id, role: 'owner', businessId: business._id });
     (req.session as any).userId = String(owner._id);
     (req.session as any).token = token;
+    (req.session as any).epoch = owner.session_epoch;
 
     res.status(201).json({ message: 'Business registered successfully', token });
   } catch (err: any) {
@@ -122,56 +276,9 @@ router.post('/login', async (req, res) => {
       if (!valid) return res.status(400).json({ message: 'reCAPTCHA verification failed' });
     }
 
-    const user = await User.findOne({ phone, deleted_at: null });
-    if (!user) return res.status(404).json({ message: 'Account not found' });
-
-    // Check lockout
-    if (user.locked_until) {
-      const lockedUntil = DateTime.fromISO(user.locked_until);
-      if (DateTime.now().toUTC() < lockedUntil) {
-        const minutesLeft = Math.ceil(lockedUntil.diffNow('minutes').minutes);
-        return res.status(403).json({
-          message: `Account locked. Try again in ${minutesLeft} minute(s).`,
-          locked_until: user.locked_until,
-        });
-      } else {
-        user.locked_until = null;
-        user.failed_login_count = 0;
-      }
-    }
-
-    if (!user.is_active) {
-      return res.status(403).json({ message: 'Account is inactive' });
-    }
-
-    if (user.business_id) {
-      const business = await Business.findById(user.business_id);
-      if (business && business.status !== 'active') {
-        return res.status(403).json({ message: 'This account has been paused. Please contact Apsara support.' });
-      }
-    }
-
-    const isMatch = await verifyCredential(user, password);
-    if (!isMatch) {
-      user.failed_login_count = (user.failed_login_count || 0) + 1;
-      if (user.failed_login_count >= MAX_FAILED_ATTEMPTS) {
-        user.locked_until = DateTime.now().toUTC().plus({ minutes: LOCKOUT_MINUTES }).toISO();
-        await user.save();
-        return res.status(403).json({
-          message: `Too many failed attempts. Account locked for ${LOCKOUT_MINUTES} minutes.`,
-        });
-      }
-      await user.save();
-      return res.status(400).json({
-        message: 'Invalid credentials',
-        attempts_remaining: MAX_FAILED_ATTEMPTS - user.failed_login_count,
-      });
-    }
-
-    // Reset on success
-    user.failed_login_count = 0;
-    user.locked_until = null;
-    await user.save();
+    const outcome = await verifyLogin(phone, password, req.sessionStore);
+    if (!outcome.ok) return res.status(outcome.failure.status).json(outcome.failure.body);
+    const { user } = outcome;
 
     // Concurrent-session limit: reject the 4th simultaneous login instead of silently
     // allowing unlimited devices. Sessions past their TTL age out of ActiveSession
@@ -188,6 +295,9 @@ router.post('/login', async (req, res) => {
     const token = generateToken({ id: user._id, role: user.role as any, businessId: user.business_id });
     (req.session as any).userId = String(user._id);
     (req.session as any).token = token;
+    // Stamped so sessionVerification can spot a session minted before a later role/PIN change
+    // and reject it — see invalidateUserSessions().
+    (req.session as any).epoch = user.session_epoch;
 
     await ActiveSession.create({
       user_id: user._id,
@@ -215,13 +325,18 @@ router.post('/revoke-session', async (req, res) => {
   // /login's active_sessions list) — deliberately not the raw express-session id, which
   // clients never see.
   const { phone, password, active_session_id } = req.body;
-  if (!active_session_id) return res.status(400).json({ message: 'active_session_id is required' });
+  if (typeof active_session_id !== 'string' || !mongoose.Types.ObjectId.isValid(active_session_id)) {
+    // Checked up front rather than letting a malformed id reach the query, where Mongoose's
+    // CastError would surface as an unhelpful 500.
+    return res.status(400).json({ message: 'A valid active_session_id is required' });
+  }
   try {
-    const user = await User.findOne({ phone, deleted_at: null });
-    if (!user) return res.status(404).json({ message: 'Account not found' });
-
-    const isMatch = await verifyCredential(user, password);
-    if (!isMatch) return res.status(400).json({ message: 'Invalid credentials' });
+    // Same throttled path as /login — this endpoint used to call verifyCredential directly,
+    // which meant unlimited guesses against a 5-digit staff PIN with no lockout and a clean
+    // right/wrong signal in the response.
+    const outcome = await verifyLogin(phone, password, req.sessionStore);
+    if (!outcome.ok) return res.status(outcome.failure.status).json(outcome.failure.body);
+    const { user } = outcome;
 
     const session = await ActiveSession.findOne({ _id: active_session_id, user_id: user._id });
     if (!session) return res.status(404).json({ message: 'Session not found' });

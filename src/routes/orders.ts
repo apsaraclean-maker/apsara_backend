@@ -20,6 +20,7 @@ import {
 import { sessionVerification, authorizeRoles, getAccessibleBranchIds, type AuthRequest } from '../middleware/auth.js';
 import { buildWhatsAppMessage, type WhatsAppEvent } from '../services/whatsapp.js';
 import { isOrderDelayed, delayedMatchCondition } from '../utils/orderDelay.js';
+import { buildSearchRegex } from '../utils/searchRegex.js';
 import { nowInBusinessTz, parseDateInBusinessTz } from '../utils/timezone.js';
 
 // True if the caller (already business-scoped by whatever lookup found `order`) is also
@@ -275,13 +276,13 @@ router.get('/', async (req: AuthRequest, res) => {
       });
     }
 
-    if (search) {
-      const escaped = (search as string).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const searchRe = buildSearchRegex(search);
+    if (searchRe) {
       andConditions.push({
         $or: [
-          { customer_name: { $regex: escaped, $options: 'i' } },
-          { order_number: { $regex: escaped, $options: 'i' } },
-          { customer_mobile: { $regex: escaped, $options: 'i' } },
+          { customer_name: searchRe },
+          { order_number: searchRe },
+          { customer_mobile: searchRe },
         ],
       });
     }

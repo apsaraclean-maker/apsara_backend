@@ -67,8 +67,16 @@ const userSchema = new mongoose.Schema({
   role: { type: String, enum: ['admin', 'owner', 'manager', 'worker'], required: true },
   employee_id: { type: String, default: null },
   is_active: { type: Boolean, default: true },
+  // Cumulative across lockouts — deliberately NOT reset when a lockout expires, which is
+  // what lets the count climb 10 → 20 → 30 and trip the disable in verifyLogin(). Reset to
+  // zero only on a successful login or when an owner/support re-activates the account.
   failed_login_count: { type: Number, default: 0 },
   locked_until: { type: String, default: null },
+  // Bumped whenever a change must invalidate every session this user holds, on every device
+  // at once (role change, PIN change, disable). Stamped into the session at login and
+  // compared on each request — a mismatch is a 401. Preferred over hunting down and deleting
+  // individual sessions because it's atomic and survives a session-store restart.
+  session_epoch: { type: Number, default: 0 },
   deleted_at: { type: String, default: null },
   createdAt: { type: String, default: getUTCNow },
   updatedAt: { type: String, default: getUTCNow },
