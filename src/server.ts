@@ -161,17 +161,9 @@ async function startServer() {
   app.use('/api/analytics', analyticsRoutes);
   app.use('/api/geocode', geocodeRoutes);
 
-  // Master data
-  app.get('/api/master/articles', async (_req, res) => {
-    const { Article } = await import('./models.js');
-    const articles = await Article.find().sort({ name: 1 });
-    res.json(articles);
-  });
-  app.get('/api/master/washing-methods', async (_req, res) => {
-    const { WashingMethod } = await import('./models.js');
-    const methods = await WashingMethod.find().sort({ name: 1 });
-    res.json(methods);
-  });
+  // Master data (articles / washing methods) lives on the services router as
+  // /api/services/master/*. It was duplicated here too, byte-identical but outside
+  // sessionVerification, so the same reference data was readable without logging in.
 
   // Health check
   app.get('/check-status', (_req, res) => res.json({ message: 'Ok' }));

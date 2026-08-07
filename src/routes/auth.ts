@@ -1,10 +1,9 @@
 import { Router } from 'express';
 import bcrypt from 'bcryptjs';
 import axios from 'axios';
-import crypto from 'crypto';
 import mongoose from 'mongoose';
 import { DateTime } from 'luxon';
-import { User, Business, Branch, ActiveSession, OTP } from '../models.js';
+import { User, Business, Branch, ActiveSession } from '../models.js';
 import { generateToken, sessionVerification, type AuthRequest } from '../middleware/auth.js';
 import { decryptPin, encryptPin, generatePin } from '../utils/pinCrypto.js';
 import { generateBranchCode } from './branches.js';
@@ -380,31 +379,6 @@ router.get('/me', sessionVerification, async (req: AuthRequest, res) => {
     // Appended as a scalar instead of populating business_id, which callers use as an id.
     const business = user.business_id ? await Business.findById(user.business_id).select('name') : null;
     res.json({ ...user.toObject(), business_name: business?.name || '' });
-  } catch (err: any) {
-    res.status(500).json({ message: err.message });
-  }
-});
-
-// POST /api/auth/request-otp (for staff verification flows)
-router.post('/request-otp', sessionVerification, async (req, res) => {
-  const { phone } = req.body;
-  try {
-    const code = String(parseInt(crypto.randomBytes(3).toString('hex'), 16) % 900000 + 100000);
-    await OTP.create({ phone, otp: code });
-    res.json({ message: 'OTP sent', phone });
-  } catch (err: any) {
-    res.status(500).json({ message: err.message });
-  }
-});
-
-// POST /api/auth/verify-otp
-router.post('/verify-otp', async (req, res) => {
-  const { phone, otp } = req.body;
-  try {
-    const otpDoc = await OTP.findOne({ phone, otp });
-    if (!otpDoc) return res.status(400).json({ message: 'Invalid or expired OTP' });
-    await OTP.deleteOne({ phone });
-    res.json({ message: 'OTP verified' });
   } catch (err: any) {
     res.status(500).json({ message: err.message });
   }

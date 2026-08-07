@@ -171,6 +171,11 @@ const orderSchema = new mongoose.Schema({
 orderSchema.index({ business_id: 1, createdAt: -1 });
 orderSchema.index({ business_id: 1, branch_id: 1, status: 1 });
 orderSchema.index({ business_id: 1, deleted_at: 1 });
+// The Branch Card's per-branch revenue/orders/rating rollups match on branch_id without a
+// business_id, which the compound index above cannot serve — a compound index is only usable
+// from its leading field, so those were collection scans. createdAt trails it because the
+// revenue rollup also windows to the current month.
+orderSchema.index({ branch_id: 1, createdAt: -1 });
 export const Order = mongoose.model('Order', orderSchema);
 
 // ─── OrderService ─────────────────────────────────────────────────────────────
@@ -263,15 +268,6 @@ const washingMethodSchema = new mongoose.Schema({
   createdAt: { type: String, default: getUTCNow },
 });
 export const WashingMethod = mongoose.model('WashingMethod', washingMethodSchema);
-
-// ─── OTP ─────────────────────────────────────────────────────────────────────
-
-const otpSchema = new mongoose.Schema({
-  phone: { type: String, required: true },
-  otp: { type: String, required: true },
-  createdAt: { type: Date, default: getUTCNowAsDate, expires: 600 },
-});
-export const OTP = mongoose.model('OTP', otpSchema);
 
 // ─── ActiveSession ────────────────────────────────────────────────────────────
 // Tracks each logged-in session per user so login can enforce a device-count limit and

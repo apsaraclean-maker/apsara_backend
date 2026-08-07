@@ -326,23 +326,40 @@ router.get('/', async (req: AuthRequest, res) => {
     }
 
     // Attach line items + image count + rating (PRD: Order Card shows the customer
-    // rating once the order is paid and the customer has submitted one)
-    const enriched = await Promise.all(
-      orders.map(async (o) => {
-        const [items, imageCount, rating] = await Promise.all([
-          OrderService.find({ order_id: o._id }),
-          OrderImage.countDocuments({ order_id: o._id }),
-          OrderRating.findOne({ order_id: o._id }).select('overall_rating submitted_at'),
-        ]);
-        return {
-          ...o.toObject(),
-          items,
-          image_count: imageCount,
-          customer_rating: rating?.submitted_at ? rating.overall_rating : null,
-          ...(include_history === 'true' ? { status_history: historyByOrder[String(o._id)] ?? [] } : {}),
-        };
-      })
-    );
+    // rating once the order is paid and the customer has submitted one).
+    //
+    // Three batched queries for the whole page rather than three per order. This ran inside
+    // orders.map(async …) before, so a default page cost 60 round trips and a full 200-card
+    // Quickview cost 600. Same $in-and-group shape the status-history block above already
+    // uses — all three collections are indexed on order_id, so each is one indexed scan.
+    const orderIds = orders.map((o) => o._id);
+    const [allItems, imageCounts, ratings] = await Promise.all([
+      OrderService.find({ order_id: { $in: orderIds } }),
+      OrderImage.aggregate<{ _id: any; count: number }>([
+        { $match: { order_id: { $in: orderIds } } },
+        { $group: { _id: '$order_id', count: { $sum: 1 } } },
+      ]),
+      OrderRating.find({ order_id: { $in: orderIds } }).select('order_id overall_rating submitted_at'),
+    ]);
+
+    const itemsByOrder = allItems.reduce((acc, i) => {
+      (acc[String(i.order_id)] ||= []).push(i);
+      return acc;
+    }, {} as Record<string, typeof allItems>);
+    const imageCountByOrder = new Map(imageCounts.map((r) => [String(r._id), r.count]));
+    const ratingByOrder = new Map(ratings.map((r) => [String(r.order_id), r]));
+
+    const enriched = orders.map((o) => {
+      const key = String(o._id);
+      const rating = ratingByOrder.get(key);
+      return {
+        ...o.toObject(),
+        items: itemsByOrder[key] ?? [],
+        image_count: imageCountByOrder.get(key) ?? 0,
+        customer_rating: rating?.submitted_at ? rating.overall_rating : null,
+        ...(include_history === 'true' ? { status_history: historyByOrder[key] ?? [] } : {}),
+      };
+    });
 
     res.json({ orders: enriched, total, page: parseInt(page as string), limit: limitNum });
   } catch (err: any) {

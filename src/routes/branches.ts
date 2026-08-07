@@ -1,7 +1,6 @@
 import { Router } from 'express';
-import mongoose from 'mongoose';
 import { DateTime } from 'luxon';
-import { Branch, BranchService, UserBranch, Service, User, Order, OrderRating } from '../models.js';
+import { Branch, BranchService, UserBranch, Service, User, Order } from '../models.js';
 import { sessionVerification, authorizeRoles, getAccessibleBranchIds, type AuthRequest } from '../middleware/auth.js';
 import { nowInBusinessTz } from '../utils/timezone.js';
 
@@ -88,34 +87,66 @@ router.get('/', async (req: AuthRequest, res) => {
     // Attach service + staff counts, plus the Branch Card's "Revenue & Orders" tag
     // (current calendar month, mirroring /dashboard/stats' convention of filtering by
     // createdAt window + current status rather than a point-in-time history join).
+    //
+    // Four aggregates for the whole list, grouped by branch. This used to run five queries
+    // per branch inside branches.map(async …), so ten branches meant fifty round trips.
+    // The rating one was the expensive part: it started from OrderRating and $lookup'd the
+    // entire orders collection, once per branch, with nothing indexable to narrow it. It's
+    // inverted here to start from Order — where branch_id is indexed — so the $lookup runs
+    // against the already-narrowed set and rides OrderRating's unique order_id index.
     const monthStart = nowInBusinessTz().startOf('month').toUTC().toISO()!;
-    const enriched = await Promise.all(
-      branches.map(async (b) => {
-        const [serviceCount, staffCount, revenueAgg, orderCount, ratingAgg] = await Promise.all([
-          BranchService.countDocuments({ branch_id: b._id }),
-          UserBranch.countDocuments({ branch_id: b._id }),
-          Order.aggregate([
-            { $match: { branch_id: b._id, status: 'paid', createdAt: { $gte: monthStart } } },
-            { $group: { _id: null, total: { $sum: '$total_price' } } },
-          ]),
-          Order.countDocuments({ branch_id: b._id, deleted_at: null, createdAt: { $gte: monthStart } }),
-          OrderRating.aggregate([
-            { $lookup: { from: 'orders', localField: 'order_id', foreignField: '_id', as: 'order' } },
-            { $unwind: '$order' },
-            { $match: { 'order.branch_id': new mongoose.Types.ObjectId(b._id as any), submitted_at: { $ne: null } } },
-            { $group: { _id: null, avg: { $avg: '$overall_rating' } } },
-          ]),
-        ]);
-        return {
-          ...b.toObject(),
-          service_count: serviceCount,
-          staff_count: staffCount,
-          monthly_revenue: revenueAgg[0]?.total || 0,
-          monthly_orders: orderCount,
-          rating: ratingAgg[0]?.avg ? Math.round(ratingAgg[0].avg * 10) / 10 : null,
-        };
-      })
-    );
+    const branchIds = branches.map((b) => b._id);
+
+    const [serviceCounts, staffCounts, monthlyAgg, ratingAgg] = await Promise.all([
+      BranchService.aggregate<{ _id: any; count: number }>([
+        { $match: { branch_id: { $in: branchIds } } },
+        { $group: { _id: '$branch_id', count: { $sum: 1 } } },
+      ]),
+      UserBranch.aggregate<{ _id: any; count: number }>([
+        { $match: { branch_id: { $in: branchIds } } },
+        { $group: { _id: '$branch_id', count: { $sum: 1 } } },
+      ]),
+      // Revenue and order count in one pass. The two used to disagree about soft-deleted
+      // orders — revenue counted them, the order count didn't — so the $cond arms preserve
+      // each one's original filter exactly rather than quietly changing either number.
+      Order.aggregate<{ _id: any; revenue: number; orders: number }>([
+        { $match: { branch_id: { $in: branchIds }, createdAt: { $gte: monthStart } } },
+        {
+          $group: {
+            _id: '$branch_id',
+            revenue: { $sum: { $cond: [{ $eq: ['$status', 'paid'] }, '$total_price', 0] } },
+            orders: { $sum: { $cond: [{ $eq: ['$deleted_at', null] }, 1, 0] } },
+          },
+        },
+      ]),
+      Order.aggregate<{ _id: any; avg: number }>([
+        { $match: { branch_id: { $in: branchIds } } },
+        { $lookup: { from: 'orderratings', localField: '_id', foreignField: 'order_id', as: 'rating' } },
+        { $unwind: '$rating' },
+        { $match: { 'rating.submitted_at': { $ne: null } } },
+        { $group: { _id: '$branch_id', avg: { $avg: '$rating.overall_rating' } } },
+      ]),
+    ]);
+
+    const byId = <T extends { _id: any }>(rows: T[]) => new Map(rows.map((r) => [String(r._id), r]));
+    const serviceById = byId(serviceCounts);
+    const staffById = byId(staffCounts);
+    const monthlyById = byId(monthlyAgg);
+    const ratingById = byId(ratingAgg);
+
+    const enriched = branches.map((b) => {
+      const key = String(b._id);
+      const monthly = monthlyById.get(key);
+      const avg = ratingById.get(key)?.avg;
+      return {
+        ...b.toObject(),
+        service_count: serviceById.get(key)?.count ?? 0,
+        staff_count: staffById.get(key)?.count ?? 0,
+        monthly_revenue: monthly?.revenue ?? 0,
+        monthly_orders: monthly?.orders ?? 0,
+        rating: avg ? Math.round(avg * 10) / 10 : null,
+      };
+    });
 
     res.json(enriched);
   } catch (err: any) {
