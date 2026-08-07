@@ -31,11 +31,14 @@ import geocodeRoutes from './routes/geocode.js';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+// Origin match is exact, so the apex and www hosts each need their own entry —
+// the admin portal is served from www.apsaraclean.com/admin-portal.
 const ALLOWED_ORIGINS = [
   'https://funny-llama-333beb.netlify.app',
   'http://localhost:3000',
   'http://localhost:3002',
   'https://apsaraclean.com',
+  'https://www.apsaraclean.com',
   'https://apsara-web.vercel.app',
 ];
 

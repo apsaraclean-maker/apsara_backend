@@ -61,6 +61,8 @@ router.get('/businesses', adminAuthMiddleware, async (_req, res) => {
           name: biz.name,
           phone: biz.phone,
           address: biz.address,
+          pincode: biz.pincode,
+          state: biz.state,
           status: biz.status,
           createdAt: biz.createdAt,
           owner_name: owner?.name || '',
@@ -78,7 +80,7 @@ router.get('/businesses', adminAuthMiddleware, async (_req, res) => {
 
 // PUT /api/admin/businesses/:id
 router.put('/businesses/:id', adminAuthMiddleware, async (req, res) => {
-  const { name, address, phone, owner_name } = req.body;
+  const { name, address, phone, pincode, state, owner_name } = req.body;
   try {
     const business = await Business.findById(req.params.id);
     if (!business) return res.status(404).json({ message: 'Business not found' });
@@ -86,6 +88,8 @@ router.put('/businesses/:id', adminAuthMiddleware, async (req, res) => {
     if (name) business.name = name;
     if (address !== undefined) business.address = address;
     if (phone !== undefined) business.phone = phone;
+    if (pincode !== undefined) business.pincode = pincode;
+    if (state !== undefined) business.state = state;
     business.updatedAt = DateTime.now().toUTC().toISO()!;
     await business.save();
 
