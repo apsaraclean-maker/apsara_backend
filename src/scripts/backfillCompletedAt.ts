@@ -45,10 +45,10 @@ async function main() {
     status: 'completed',
   }).select('order_id changed_at').sort({ changed_at: -1 });
 
-  const completedAtByOrder = new Map<string, string>();
+  const completedAtByOrder = new Map<string, Date>();
   for (const entry of history) {
     const key = String(entry.order_id);
-    if (!completedAtByOrder.has(key)) completedAtByOrder.set(key, entry.changed_at);
+    if (!completedAtByOrder.has(key)) completedAtByOrder.set(key, entry.changed_at as Date);
   }
 
   let resolved = 0;
@@ -65,7 +65,7 @@ async function main() {
       continue;
     }
     resolved += 1;
-    if (order.delivery_due_date && completedAt > order.delivery_due_date) wouldBeDelayed += 1;
+    if (order.delivery_due_date && completedAt.getTime() > order.delivery_due_date.getTime()) wouldBeDelayed += 1;
     writes.push({ updateOne: { filter: { _id: order._id }, update: { $set: { completed_at: completedAt } } } });
   }
 

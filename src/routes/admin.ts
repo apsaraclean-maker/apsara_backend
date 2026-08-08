@@ -1,14 +1,21 @@
 import { Router } from 'express';
 import bcrypt from 'bcryptjs';
+import mongoose from 'mongoose';
 import { DateTime } from 'luxon';
 import { Business, User, Payment, AdminUser } from '../models.js';
 import { generateAdminToken, adminAuthMiddleware, type AuthRequest } from '../middleware/auth.js';
 import { invalidateUserSessions } from '../utils/sessionControl.js';
+import { invalidateBusinessContext } from '../utils/authCache.js';
 
 const router = Router();
 
-function getCurrentBillingCycle(registrationDateStr: string): { cycleStart: string; cycleEnd: string } {
-  const regDate = DateTime.fromISO(registrationDateStr).toUTC();
+// Accepts the Date the schema now stores, or an ISO string from a row predating the
+// timestamp migration.
+function getCurrentBillingCycle(registrationDate: Date | string): { cycleStart: string; cycleEnd: string } {
+  const regDate = (registrationDate instanceof Date
+    ? DateTime.fromJSDate(registrationDate)
+    : DateTime.fromISO(registrationDate)
+  ).toUTC();
   const regDay = regDate.day;
   const today = DateTime.now().toUTC();
 
@@ -44,39 +51,66 @@ router.post('/login', async (req, res) => {
 // GET /api/admin/businesses
 router.get('/businesses', adminAuthMiddleware, async (_req, res) => {
   try {
-    const businesses = await Business.find().sort({ createdAt: -1 });
+    const businesses = await Business.find().sort({ createdAt: -1 }).lean();
 
-    const result = await Promise.all(
-      businesses.map(async (biz) => {
-        const owner = await User.findById(biz.owner_id).select('name phone is_active failed_login_count');
-        let paymentLabel = 'N/A';
+    // Two queries for the whole list rather than two per business. This ran as a findById for
+    // the owner plus a findOne for the current cycle's payment inside businesses.map(async …),
+    // so a platform with 50 businesses issued 100 round trips to render one admin table.
+    //
+    // The cycle start differs per business (it's derived from each one's own registration
+    // date), so the payment lookup can't be a single equality — it's an $or over the
+    // (business_id, cycle_start_date) pairs, which the existing compound index on Payment
+    // serves directly.
+    const cycleByBusiness = new Map<string, string>();
+    for (const biz of businesses) {
+      if (biz.status === 'active') {
+        cycleByBusiness.set(String(biz._id), getCurrentBillingCycle(biz.createdAt).cycleStart);
+      }
+    }
 
-        if (biz.status === 'active') {
-          const { cycleStart } = getCurrentBillingCycle(biz.createdAt);
-          const payment = await Payment.findOne({ business_id: biz._id, cycle_start_date: cycleStart });
-          paymentLabel = payment ? 'Paid' : 'Delayed';
-        }
+    const [owners, payments] = await Promise.all([
+      User.find({ _id: { $in: businesses.map((b) => b.owner_id) } })
+        .select('name phone is_active failed_login_count')
+        .lean(),
+      cycleByBusiness.size
+        ? Payment.find({
+            $or: [...cycleByBusiness].map(([businessId, cycleStart]) => ({
+              business_id: new mongoose.Types.ObjectId(businessId),
+              cycle_start_date: cycleStart,
+            })),
+          })
+            .select('business_id cycle_start_date')
+            .lean()
+        : Promise.resolve([] as any[]),
+    ]);
 
-        return {
-          _id: biz._id,
-          name: biz.name,
-          phone: biz.phone,
-          address: biz.address,
-          pincode: biz.pincode,
-          state: biz.state,
-          status: biz.status,
-          createdAt: biz.createdAt,
-          owner_name: owner?.name || '',
-          owner_phone: owner?.phone || '',
-          // Surfaced so support can see and clear an owner auto-disabled by the failed-login
-          // escalation in auth.ts — an owner has nobody above them to flip the toggle, so
-          // this panel is the only way back in.
-          owner_id: owner?._id || null,
-          owner_is_active: owner?.is_active ?? true,
-          payment_label: paymentLabel,
-        };
-      })
-    );
+    const ownerById = new Map(owners.map((o) => [String(o._id), o]));
+    const paidBusinessIds = new Set(payments.map((p) => String(p.business_id)));
+
+    const result = businesses.map((biz) => {
+      const owner = ownerById.get(String(biz.owner_id));
+      const paymentLabel =
+        biz.status !== 'active' ? 'N/A' : paidBusinessIds.has(String(biz._id)) ? 'Paid' : 'Delayed';
+
+      return {
+        _id: biz._id,
+        name: biz.name,
+        phone: biz.phone,
+        address: biz.address,
+        pincode: biz.pincode,
+        state: biz.state,
+        status: biz.status,
+        createdAt: biz.createdAt,
+        owner_name: owner?.name || '',
+        owner_phone: owner?.phone || '',
+        // Surfaced so support can see and clear an owner auto-disabled by the failed-login
+        // escalation in auth.ts — an owner has nobody above them to flip the toggle, so
+        // this panel is the only way back in.
+        owner_id: owner?._id || null,
+        owner_is_active: owner?.is_active ?? true,
+        payment_label: paymentLabel,
+      };
+    });
 
     res.json(result);
   } catch (err: any) {
@@ -96,11 +130,11 @@ router.put('/businesses/:id', adminAuthMiddleware, async (req, res) => {
     if (phone !== undefined) business.phone = phone;
     if (pincode !== undefined) business.pincode = pincode;
     if (state !== undefined) business.state = state;
-    business.updatedAt = DateTime.now().toUTC().toISO()!;
+    business.updatedAt = DateTime.now().toUTC().toJSDate();
     await business.save();
 
     if (owner_name) {
-      await User.findByIdAndUpdate(business.owner_id, { name: owner_name, updatedAt: DateTime.now().toUTC().toISO() });
+      await User.findByIdAndUpdate(business.owner_id, { name: owner_name, updatedAt: DateTime.now().toUTC().toJSDate() });
     }
 
     res.json(business);
@@ -116,8 +150,13 @@ router.patch('/businesses/:id/status', adminAuthMiddleware, async (req, res) => 
     if (!business) return res.status(404).json({ message: 'Business not found' });
 
     business.status = business.status === 'active' ? 'inactive' : 'active';
-    business.updatedAt = DateTime.now().toUTC().toISO()!;
+    business.updatedAt = DateTime.now().toUTC().toJSDate();
     await business.save();
+
+    // sessionVerification reads the pause flag through a short-lived cache, so pausing or
+    // reactivating a business has to evict it — otherwise the change wouldn't reach that
+    // business's users until the entry aged out.
+    await invalidateBusinessContext(business._id);
 
     res.json({ message: `Business ${business.status}`, business });
   } catch (err: any) {
@@ -148,7 +187,7 @@ router.patch('/users/:id/status', adminAuthMiddleware, async (req, res) => {
       user.locked_until = null;
     }
     user.is_active = is_active;
-    user.updatedAt = DateTime.now().toUTC().toISO()!;
+    user.updatedAt = DateTime.now().toUTC().toJSDate();
     await user.save();
 
     // Disabling has to end any session they still hold rather than wait for the cookie to
@@ -174,7 +213,8 @@ router.get('/businesses/:id/payments', adminAuthMiddleware, async (req, res) => 
 
     const payments = await Payment.find({ business_id: req.params.id })
       .populate('created_by', 'name username')
-      .sort({ cycle_start_date: -1 });
+      .sort({ cycle_start_date: -1 })
+      .lean();
 
     const { cycleStart, cycleEnd } = getCurrentBillingCycle(business.createdAt);
     const currentCycleHasPayment = payments.some((p) => p.cycle_start_date === cycleStart);
@@ -233,7 +273,7 @@ router.put('/payments/:id', adminAuthMiddleware, async (req, res) => {
     if (notes !== undefined) payment.notes = notes;
     if (cycle_start_date) payment.cycle_start_date = cycle_start_date;
     if (cycle_end_date) payment.cycle_end_date = cycle_end_date;
-    payment.updatedAt = DateTime.now().toUTC().toISO()!;
+    payment.updatedAt = DateTime.now().toUTC().toJSDate();
     await payment.save();
 
     res.json(payment);

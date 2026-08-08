@@ -4,6 +4,7 @@ dns.setDefaultResultOrder('ipv4first');
 
 import express from 'express';
 import helmet from 'helmet';
+import compression from 'compression';
 import session from 'express-session';
 import { RedisStore } from 'connect-redis';
 import mongoose from 'mongoose';
@@ -15,8 +16,10 @@ import cron from 'node-cron';
 
 import { rejectQueryOperators } from './middleware/sanitize.js';
 import { redisClient } from './config/redis.js';
+import { setAuthCacheEnabled } from './utils/authCache.js';
 import { seedDatabase } from './config/seed.js';
 import { purgeExpiredSoftDeletes } from './config/purge.js';
+import { sweepOverdueOrders } from './config/delaySweep.js';
 
 import authRoutes from './routes/auth.js';
 import branchRoutes from './routes/branches.js';
@@ -51,7 +54,22 @@ async function startServer() {
 
   // ─── MongoDB ────────────────────────────────────────────────────────────────
   try {
-    await mongoose.connect(MONGODB_URI, { family: 4 });
+    await mongoose.connect(MONGODB_URI, {
+      family: 4,
+      // Wire compression between the app and the database. Order lists and report rows are
+      // large, repetitive JSON — exactly what zstd collapses — and this is pure win whenever
+      // the database isn't on the same host. Drivers negotiate down to no compression if the
+      // server doesn't support it, so it's safe against any deployment target.
+      compressors: ['zstd', 'zlib'],
+      // Fail a request rather than queue it indefinitely when the primary is unreachable.
+      serverSelectionTimeoutMS: 10000,
+      maxPoolSize: 50,
+      // Index builds are a deploy-time operation, not a per-boot one. Mongoose otherwise
+      // re-issues createIndex for every index in the schema on every start, which on a large
+      // collection is slow and competes with live traffic. Run `npm run sync-indexes` after
+      // deploying a schema change instead — see scripts/syncIndexes.ts.
+      autoIndex: process.env.NODE_ENV !== 'production',
+    });
     console.log('Connected to MongoDB');
     await seedDatabase();
   } catch (err) {
@@ -86,6 +104,12 @@ async function startServer() {
     })
   );
 
+  // Mounted ahead of the routes so every JSON response is compressed on the way out. Order
+  // lists, report rows and the dashboard payloads are large, highly repetitive JSON that
+  // typically shrinks by ~85% — on the mobile connections this app is actually used over,
+  // that's the single largest contributor to perceived response time.
+  app.use(compression());
+
   app.use(express.json({ limit: '10mb' }));
   app.use(cookieParser());
   // Runs after the body parser (so req.body is populated) and before any route, so no
@@ -94,7 +118,20 @@ async function startServer() {
   // nosniff: uploaded order images are validated by extension+mimetype, not real content
   // sniffing, so this stops a browser from re-interpreting a served file as something other
   // than its declared type.
-  app.use('/uploads', express.static(uploadsDir, { setHeaders: (res) => res.setHeader('X-Content-Type-Options', 'nosniff') }));
+  //
+  // Uploads are immutable once written — the filename carries a timestamp and a random
+  // suffix (see the multer config in routes/orders.ts), so a given URL always names the same
+  // bytes and can never be updated in place. Without a cache directive the browser
+  // revalidated every order image on every render of every card; `immutable` means it stops
+  // asking entirely for a year.
+  app.use(
+    '/uploads',
+    express.static(uploadsDir, {
+      maxAge: '1y',
+      immutable: true,
+      setHeaders: (res) => res.setHeader('X-Content-Type-Options', 'nosniff'),
+    })
+  );
 
   // ─── CORS ───────────────────────────────────────────────────────────────────
   app.use((req, res, next) => {
@@ -127,6 +164,11 @@ async function startServer() {
   if (!redisReady) {
     console.warn('[session] Redis unreachable — using in-memory session store instead (dev/local fallback only).');
   }
+
+  // The auth-context cache shares this verdict rather than discovering it per request. With
+  // no Redis it turns itself off entirely, so sessionVerification reads straight from Mongo
+  // instead of issuing commands that can only fail.
+  setAuthCacheEnabled(redisReady);
 
   app.use(
     session({
@@ -173,6 +215,18 @@ async function startServer() {
   // 3-month retention window (PRD requirement, Phase 8).
   cron.schedule('0 3 * * *', () => {
     purgeExpiredSoftDeletes().catch((err) => console.error('[purge] failed:', err));
+  });
+
+  // Every few minutes — flips is_delayed on open orders that have crossed their due date.
+  //
+  // This is the one delay transition no request can catch, because it isn't caused by a
+  // request: an order simply sits there and the deadline passes. Every other transition
+  // (completing, cancelling, editing the due date) recomputes the flag inline on the write.
+  // Running at :00, :10, :20 … keeps the Dashboard's delayed count within ten minutes of the
+  // truth, which is well inside what the number is used for; the query it runs is a narrow
+  // indexed match, so the cost of the tick is negligible when nothing has expired.
+  cron.schedule('*/10 * * * *', () => {
+    sweepOverdueOrders().catch((err) => console.error('[delaySweep] failed:', err));
   });
 
   // ─── Start ──────────────────────────────────────────────────────────────────

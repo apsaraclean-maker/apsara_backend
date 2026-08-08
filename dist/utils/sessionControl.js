@@ -1,7 +1,5 @@
-import type { Store } from 'express-session';
 import { User, ActiveSession } from '../models.js';
 import { invalidateUserContext } from './authCache.js';
-
 /**
  * Kills every session a user holds, on every device, immediately.
  *
@@ -32,28 +30,21 @@ import { invalidateUserContext } from './authCache.js';
  *     Done first, before the bump, so there is no window in which a concurrent request can
  *     re-prime the cache from the pre-bump database state.
  */
-export async function invalidateUserSessions(userId: unknown, store?: Store): Promise<void> {
-  await invalidateUserContext(userId);
-  await User.updateOne({ _id: userId as any }, { $inc: { session_epoch: 1 } });
-  // Again after the write: a request racing the bump could have re-primed the cache from the
-  // old row between the two statements above.
-  await invalidateUserContext(userId);
-
-  const sessions = await ActiveSession.find({ user_id: userId as any }).select('session_id');
-
-  if (store) {
-    await Promise.all(
-      sessions.map(
-        (s) =>
-          new Promise<void>((resolve) => {
+export async function invalidateUserSessions(userId, store) {
+    await invalidateUserContext(userId);
+    await User.updateOne({ _id: userId }, { $inc: { session_epoch: 1 } });
+    // Again after the write: a request racing the bump could have re-primed the cache from the
+    // old row between the two statements above.
+    await invalidateUserContext(userId);
+    const sessions = await ActiveSession.find({ user_id: userId }).select('session_id');
+    if (store) {
+        await Promise.all(sessions.map((s) => new Promise((resolve) => {
             store.destroy(s.session_id, (err) => {
-              if (err) console.error('[sessionControl] store destroy failed (non-fatal):', err.message);
-              resolve();
+                if (err)
+                    console.error('[sessionControl] store destroy failed (non-fatal):', err.message);
+                resolve();
             });
-          })
-      )
-    );
-  }
-
-  await ActiveSession.deleteMany({ user_id: userId as any });
+        })));
+    }
+    await ActiveSession.deleteMany({ user_id: userId });
 }

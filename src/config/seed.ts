@@ -25,25 +25,35 @@ const ADMIN_USERS = [
 ];
 
 export async function seedDatabase() {
-  // Articles
-  await Article.deleteMany({ name: { $nin: ARTICLES } });
-  for (const name of ARTICLES) {
-    await Article.findOneAndUpdate({ name }, { name }, { upsert: true });
-  }
+  // One bulkWrite per collection instead of an awaited upsert per row. This ran 58 sequential
+  // round trips on every single boot — trivial against a local database, a visible chunk of
+  // startup time against a hosted one, and repeated on every restart and every deploy.
+  await Promise.all([
+    Article.deleteMany({ name: { $nin: ARTICLES } }),
+    WashingMethod.deleteMany({ name: { $nin: WASHING_METHODS } }),
+  ]);
 
-  // Washing methods
-  await WashingMethod.deleteMany({ name: { $nin: WASHING_METHODS } });
-  for (const name of WASHING_METHODS) {
-    await WashingMethod.findOneAndUpdate({ name }, { name }, { upsert: true });
-  }
+  await Promise.all([
+    Article.bulkWrite(
+      ARTICLES.map((name) => ({ updateOne: { filter: { name }, update: { $setOnInsert: { name } }, upsert: true } }))
+    ),
+    WashingMethod.bulkWrite(
+      WASHING_METHODS.map((name) => ({ updateOne: { filter: { name }, update: { $setOnInsert: { name } }, upsert: true } }))
+    ),
+  ]);
 
-  // Admin users
+  // Admin users keep their read-then-write shape: the password has to be hashed only when the
+  // row is genuinely absent, and bcrypt on every boot for accounts that already exist would
+  // cost far more than the two queries saved.
+  const existingAdmins = await AdminUser.find({ username: { $in: ADMIN_USERS.map((a) => a.username) } })
+    .select('username')
+    .lean();
+  const haveAdmin = new Set(existingAdmins.map((a) => a.username));
+
   for (const admin of ADMIN_USERS) {
-    const existing = await AdminUser.findOne({ username: admin.username });
-    if (!existing) {
-      const password = await bcrypt.hash(admin.plainPassword, 10);
-      await AdminUser.create({ name: admin.name, username: admin.username, password });
-    }
+    if (haveAdmin.has(admin.username)) continue;
+    const password = await bcrypt.hash(admin.plainPassword, 10);
+    await AdminUser.create({ name: admin.name, username: admin.username, password });
   }
 
   console.log('Database seeded');

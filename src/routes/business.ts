@@ -11,7 +11,7 @@ router.use(sessionVerification);
 // GET /api/business/profile
 router.get('/profile', async (req: AuthRequest, res) => {
   try {
-    const business = await Business.findById(req.user!.businessId);
+    const business = await Business.findById(req.user!.businessId).lean();
     if (!business) return res.status(404).json({ message: 'Business not found' });
     res.json(business);
   } catch (err: any) {
@@ -36,7 +36,7 @@ router.put('/profile', authorizeRoles('owner'), async (req: AuthRequest, res) =>
     if (address !== undefined) business.address = address;
     if (pincode !== undefined) business.pincode = pincode;
     if (state !== undefined) business.state = state;
-    business.updatedAt = DateTime.now().toUTC().toISO()!;
+    business.updatedAt = DateTime.now().toUTC().toJSDate();
     await business.save();
 
     res.json(business);
@@ -58,15 +58,27 @@ router.get('/overview', async (req: AuthRequest, res) => {
     // count everything that exists for the business — enabled or disabled alike. Only soft
     // deletes are excluded. The active-only counts live on the sidebar, not here.
     const [me, owner, branchesCount, totalServices, totalStaff, ratingAgg] = await Promise.all([
-      User.findOne({ _id: req.user!.id }).select('name role phone employee_id pin_encrypted'),
-      User.findOne({ business_id: business._id, role: 'owner' }).select('name phone'),
+      User.findOne({ _id: req.user!.id }).select('name role phone employee_id pin_encrypted').lean(),
+      User.findOne({ business_id: business._id, role: 'owner' }).select('name phone').lean(),
       Branch.countDocuments({ business_id: business._id, deleted_at: null }),
       Service.countDocuments({ business_id: business._id, deleted_at: null }),
       User.countDocuments({ business_id: business._id, deleted_at: null, role: { $in: ['manager', 'worker'] } }),
       OrderRating.aggregate([
-        { $lookup: { from: 'orders', localField: 'order_id', foreignField: '_id', as: 'order' } },
+        // submitted_at first, on its own index. This filter used to sit after the $lookup,
+        // which meant every rating on the platform was joined to its order before anything
+        // was discarded — the same shape that was fixed in dashboard.ts /stats.
+        { $match: { submitted_at: { $ne: null } } },
+        {
+          $lookup: {
+            from: 'orders',
+            localField: 'order_id',
+            foreignField: '_id',
+            as: 'order',
+            pipeline: [{ $project: { business_id: 1 } }],
+          },
+        },
         { $unwind: '$order' },
-        { $match: { 'order.business_id': new mongoose.Types.ObjectId(business._id as any), submitted_at: { $ne: null } } },
+        { $match: { 'order.business_id': new mongoose.Types.ObjectId(business._id as any) } },
         { $group: { _id: null, avg: { $avg: '$overall_rating' } } },
       ]),
     ]);

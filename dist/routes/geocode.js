@@ -33,7 +33,9 @@ router.get('/reverse', async (req, res) => {
     }
 });
 // GET /api/geocode/search?q= — forward geocoding for the map picker's address search box
-// (jump the map to a typed address rather than only allowing click-to-place).
+// (jump the map to a typed address rather than only allowing click-to-place). The parsed
+// address parts ride along so the Create Branch page's City / Pincode suggestion dropdowns
+// (PRD "Data Size/Limit") can reuse this one endpoint instead of needing their own.
 router.get('/search', async (req, res) => {
     const { q } = req.query;
     if (!q)
@@ -43,11 +45,17 @@ router.get('/search', async (req, res) => {
             params: { q: `${q}, India`, format: 'jsonv2', addressdetails: 1, limit: 5, countrycodes: 'in' },
             headers: { 'User-Agent': USER_AGENT },
         });
-        res.json((response.data || []).map((r) => ({
-            display_name: r.display_name,
-            lat: parseFloat(r.lat),
-            lng: parseFloat(r.lon),
-        })));
+        res.json((response.data || []).map((r) => {
+            const addr = r.address || {};
+            return {
+                display_name: r.display_name,
+                lat: parseFloat(r.lat),
+                lng: parseFloat(r.lon),
+                city: addr.city || addr.town || addr.village || addr.county || '',
+                state: addr.state || '',
+                pincode: addr.postcode || '',
+            };
+        }));
     }
     catch (err) {
         res.status(502).json({ message: 'Geocode search failed' });

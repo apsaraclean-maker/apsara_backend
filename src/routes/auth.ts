@@ -90,7 +90,7 @@ async function verifyLogin(phone: unknown, password: unknown, store?: any): Prom
   if (!user) return { ok: false, failure: INVALID_CREDENTIALS };
 
   if (user.locked_until) {
-    const lockedUntil = DateTime.fromISO(user.locked_until);
+    const lockedUntil = DateTime.fromJSDate(user.locked_until);
     if (DateTime.now().toUTC() < lockedUntil) {
       const minutesLeft = Math.ceil(lockedUntil.diffNow('minutes').minutes);
       return {
@@ -149,7 +149,7 @@ async function verifyLogin(phone: unknown, password: unknown, store?: any): Prom
   }
 
   if (user.failed_login_count % MAX_FAILED_ATTEMPTS === 0) {
-    user.locked_until = DateTime.now().toUTC().plus({ minutes: LOCKOUT_MINUTES }).toISO();
+    user.locked_until = DateTime.now().toUTC().plus({ minutes: LOCKOUT_MINUTES }).toJSDate();
     await user.save();
     const cyclesLeft = (DISABLE_AFTER_ATTEMPTS - user.failed_login_count) / MAX_FAILED_ATTEMPTS;
     return {
@@ -178,6 +178,47 @@ async function verifyLogin(phone: unknown, password: unknown, store?: any): Prom
       },
     },
   };
+}
+
+/**
+ * Returns the caller's genuinely resumable sessions, deleting the bookkeeping rows for any
+ * that no longer exist in the session store.
+ *
+ * ActiveSession rows and the sessions they describe live in two different places with two
+ * different lifetimes, and only the row was ever consulted when enforcing the device limit.
+ * So a row could — and routinely did — outlive the session it stood for, and the limit then
+ * counted logins that could never be resumed by anybody:
+ *
+ *   • In development there is no Redis, so express-session falls back to its in-memory store
+ *     (see server.ts). Every restart — every file save under `tsx watch` — wipes every
+ *     session while leaving every row behind. Three restart-and-log-in cycles and the account
+ *     is locked out of logging in at all, for the seven days it takes the rows to age out.
+ *   • In production the two expiries are independent: Redis dropping a session early, or
+ *     being flushed, strands the row the same way.
+ *
+ * Checking the store is what makes the limit mean "devices you could actually still be signed
+ * in on". A store error counts as alive rather than dead, so a transient hiccup can never
+ * revoke somebody's real session.
+ */
+async function pruneDeadSessions(userId: unknown, store: any) {
+  const rows = await ActiveSession.find({ user_id: userId as any }).sort({ createdAt: 1 });
+  if (!store || typeof store.get !== 'function') return rows;
+
+  const checked = await Promise.all(
+    rows.map(
+      (row) =>
+        new Promise<{ row: typeof row; alive: boolean }>((resolve) => {
+          store.get(row.session_id, (err: any, sess: any) => resolve({ row, alive: !!err || !!sess }));
+        })
+    )
+  );
+
+  const dead = checked.filter((c) => !c.alive).map((c) => c.row._id);
+  if (dead.length) {
+    await ActiveSession.deleteMany({ _id: { $in: dead } });
+    console.log(`[auth] pruned ${dead.length} stale session record(s) with no session behind them`);
+  }
+  return checked.filter((c) => c.alive).map((c) => c.row);
 }
 
 async function verifyRecaptcha(token: string): Promise<boolean> {
@@ -280,10 +321,11 @@ router.post('/login', async (req, res) => {
     const { user } = outcome;
 
     // Concurrent-session limit: reject the 4th simultaneous login instead of silently
-    // allowing unlimited devices. Sessions past their TTL age out of ActiveSession
-    // automatically (matches the session cookie's own 7-day maxAge), so this only ever
-    // counts genuinely-active devices, not abandoned ones.
-    const activeSessions = await ActiveSession.find({ user_id: user._id }).sort({ createdAt: 1 });
+    // allowing unlimited devices. The TTL on ActiveSession matches the cookie's 7-day maxAge,
+    // but a row can stop being meaningful long before it expires — so the list is reconciled
+    // against the session store first and anything with no session behind it is dropped.
+    // Without that, the limit counts records rather than devices.
+    const activeSessions = await pruneDeadSessions(user._id, req.sessionStore);
     if (activeSessions.length >= MAX_CONCURRENT_SESSIONS) {
       return res.status(403).json({
         message: `Device limit reached (max ${MAX_CONCURRENT_SESSIONS}). Log out from another device to continue.`,
@@ -336,6 +378,11 @@ router.post('/revoke-session', async (req, res) => {
     const outcome = await verifyLogin(phone, password, req.sessionStore);
     if (!outcome.ok) return res.status(outcome.failure.status).json(outcome.failure.body);
     const { user } = outcome;
+
+    // Same reconciliation as login: if the caller is here because the limit blocked them,
+    // stale rows may be the only reason, and revoking a row that stands for nothing should
+    // still free the slot.
+    await pruneDeadSessions(user._id, req.sessionStore);
 
     const session = await ActiveSession.findOne({ _id: active_session_id, user_id: user._id });
     if (!session) return res.status(404).json({ message: 'Session not found' });

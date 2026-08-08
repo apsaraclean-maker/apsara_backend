@@ -18,46 +18,69 @@ import { DateTime } from 'luxon';
 export const FINISHED_STATUSES = ['completed', 'paid'];
 
 interface DelayableOrder {
-  is_delayed?: boolean;
-  delivery_due_date?: string | null;
-  completed_at?: string | null;
+  delivery_due_date?: Date | string | null;
+  completed_at?: Date | string | null;
   status: string;
 }
 
-export function isOrderDelayed(order: DelayableOrder): boolean {
-  if (order.is_delayed) return true;
+function toDateTime(value: Date | string): DateTime {
+  return value instanceof Date ? DateTime.fromJSDate(value) : DateTime.fromISO(value);
+}
+
+/**
+ * The authoritative delay rule, computed from the order's own fields.
+ *
+ * Note this deliberately does NOT consult `is_delayed` — that field is the *output* of this
+ * function, and reading it back in would make the value self-confirming: once set, it could
+ * never be cleared, so an order whose due date is pushed out would stay marked as late
+ * forever. Callers wanting the stored answer should read `is_delayed` directly.
+ */
+export function computeIsDelayed(order: DelayableOrder): boolean {
   if (!order.delivery_due_date) return false;
   if (order.status === 'cancelled') return false;
 
-  const due = DateTime.fromISO(order.delivery_due_date);
+  const due = toDateTime(order.delivery_due_date);
 
   if (FINISHED_STATUSES.includes(order.status)) {
     if (!order.completed_at) return false;
-    return DateTime.fromISO(order.completed_at) > due;
+    return toDateTime(order.completed_at) > due;
   }
 
   return DateTime.now().toUTC() > due;
 }
 
-// Mongo query fragment for the same definition, for filtering/counting at the DB level.
-// Both dates are stored as UTC ISO-8601 strings in the same format, so the comparison
-// Mongo performs on them is chronological.
-export function delayedMatchCondition(nowISO: string) {
+/**
+ * Back-compat alias. Reads the stored flag when there is one, otherwise recomputes — used by
+ * the report writer, which renders orders it has already loaded.
+ */
+export function isOrderDelayed(order: DelayableOrder & { is_delayed?: boolean }): boolean {
+  return order.is_delayed ?? computeIsDelayed(order);
+}
+
+/**
+ * Query fragment for "delayed only" filters and counts.
+ *
+ * This used to be a three-armed $or whose last arm was
+ * `$expr: { $gt: ['$completed_at', '$delivery_due_date'] }` — a comparison between two
+ * fields of the same document, which no index can ever satisfy. Mongo had to read and
+ * evaluate every candidate order, on every Dashboard load and every filtered list. Now that
+ * `is_delayed` is maintained as a real stored value (see recomputeIsDelayed below and the
+ * nightly sweep in config/delaySweep.ts), the same question is a plain indexed equality.
+ */
+export function delayedMatchCondition() {
+  return { is_delayed: true };
+}
+
+/**
+ * Matches open orders that have quietly crossed their due date since anyone last wrote to
+ * them — the one transition that no request-path write can catch, because nothing happens.
+ * Drives the nightly sweep.
+ */
+export function overdueOpenOrdersFilter(now: Date) {
   return {
-    $or: [
-      { is_delayed: true },
-      // Still open, and past due.
-      {
-        delivery_due_date: { $ne: null, $lt: nowISO },
-        status: { $nin: [...FINISHED_STATUSES, 'cancelled'] },
-      },
-      // Finished, but not before the due date.
-      {
-        status: { $in: FINISHED_STATUSES },
-        delivery_due_date: { $ne: null },
-        completed_at: { $ne: null },
-        $expr: { $gt: ['$completed_at', '$delivery_due_date'] },
-      },
-    ],
+    is_delayed: false,
+    deleted_at: null,
+    delivery_due_date: { $ne: null, $lt: now },
+    status: { $nin: [...FINISHED_STATUSES, 'cancelled'] },
   };
 }
