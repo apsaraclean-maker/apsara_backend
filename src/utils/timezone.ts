@@ -21,11 +21,22 @@ export function parseDateInBusinessTz(iso: string): DateTime {
   return DateTime.fromISO(iso, { zone: BUSINESS_TIMEZONE });
 }
 
-// Formats a stored UTC ISO timestamp as its IST calendar date (yyyy-MM-dd). Plain
+// Formats a stored UTC timestamp as its IST calendar date (yyyy-MM-dd). Plain
 // `DateTime.fromISO(utcString).toFormat(...)` silently depends on the server process's
 // system-default timezone (Luxon's defaultZone) unless a zone is set explicitly — fragile,
 // since that's whatever the deployment host happens to be configured with, not necessarily
 // IST or even UTC.
-export function toBusinessDateString(utcIso: string): string {
-  return DateTime.fromISO(utcIso).setZone(BUSINESS_TIMEZONE).toFormat('yyyy-MM-dd');
+//
+// Accepts a Date (what the schema stores now) or an ISO string (what aggregation output and
+// any not-yet-migrated row can still hand back).
+export function toBusinessDateString(utc: Date | string): string {
+  const dt = utc instanceof Date ? DateTime.fromJSDate(utc) : DateTime.fromISO(utc);
+  return dt.setZone(BUSINESS_TIMEZONE).toFormat('yyyy-MM-dd');
 }
+
+// Mongo's $dateToString does this same IST-calendar-day bucketing inside the aggregation
+// pipeline, which is where it belongs now that timestamps are real Dates — the Timeline used
+// to pull every matching row back into Node purely to call toBusinessDateString on each one.
+export const BUSINESS_TZ_DATE_STRING = (field: string) => ({
+  $dateToString: { format: '%Y-%m-%d', date: field, timezone: BUSINESS_TIMEZONE },
+});

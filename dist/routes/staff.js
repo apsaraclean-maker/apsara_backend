@@ -6,6 +6,9 @@ import mongoose from 'mongoose';
 import { User, UserBranch, ArchivedUser } from '../models.js';
 import { sessionVerification, authorizeRoles } from '../middleware/auth.js';
 import { encryptPin, decryptPin } from '../utils/pinCrypto.js';
+import { buildSearchRegex } from '../utils/searchRegex.js';
+import { invalidateUserSessions } from '../utils/sessionControl.js';
+import { invalidateUserContext } from '../utils/authCache.js';
 const router = Router();
 router.use(sessionVerification);
 const PIN_REGEX = /^\d{4,6}$/;
@@ -45,39 +48,64 @@ export async function takenEmployeeIds(businessId, excludeUserId) {
     };
     if (excludeUserId)
         query._id = { $ne: excludeUserId };
-    const users = await User.find(query).select('employee_id');
+    const users = await User.find(query).select('employee_id').lean();
     return users.map((u) => u.employee_id);
 }
 // GET /api/staff — viewable by all roles (owner/manager/worker); PIN is only ever
 // attached in the response for the owner (see enrichment below).
 router.get('/', async (req, res) => {
     try {
-        const { branch_id, role, search } = req.query;
-        const query = { business_id: req.user.businessId, deleted_at: null, role: { $in: ['manager', 'worker'] } };
-        if (role)
-            query.role = role;
-        if (search) {
-            const re = new RegExp(String(search), 'i');
+        const { branch_id, role, search, is_active } = req.query;
+        // The Staff Page lists managers and workers. `role` narrows that, and also accepts a
+        // comma-separated list — the Orders filter's "Created By" asks for `owner,manager`,
+        // since those are the only roles that can create an order (PRD persona rules), and the
+        // owner would otherwise be missing from a list of people who created orders.
+        const requestedRoles = role ? String(role).split(',').map((r) => r.trim()).filter(Boolean) : null;
+        const allowedRoles = requestedRoles ?? ['manager', 'worker'];
+        const query = {
+            business_id: req.user.businessId,
+            deleted_at: null,
+            role: { $in: allowedRoles.filter((r) => ['owner', 'manager', 'worker'].includes(r)) },
+        };
+        // Staff Page filter panel's tri-state status (all / active / inactive).
+        if (is_active === 'true' || is_active === 'false')
+            query.is_active = is_active === 'true';
+        const re = buildSearchRegex(search);
+        if (re) {
             query.$or = [{ name: re }, { phone: re }];
         }
-        let staff = await User.find(query).select('-password_hash').sort({ name: 1 });
-        // Filter by branch if requested
+        // Branch filtering happens in the query rather than after it. This used to load every
+        // staff member in the business and then drop the non-matching ones in JavaScript, which
+        // meant fetching (and decrypting PINs for) people the caller had explicitly filtered out.
         if (branch_id) {
-            const links = await UserBranch.find({ branch_id: new mongoose.Types.ObjectId(branch_id) }).select('user_id');
-            const assignedIds = new Set(links.map((l) => String(l.user_id)));
-            staff = staff.filter((u) => assignedIds.has(String(u._id)));
+            const links = await UserBranch.find({ branch_id: new mongoose.Types.ObjectId(branch_id) })
+                .select('user_id')
+                .lean();
+            query._id = { $in: links.map((l) => l.user_id) };
         }
+        const staff = await User.find(query).select('-password_hash').sort({ name: 1 }).lean();
         // Only the owner can see PINs (per PRD's persona rules) — decrypt for display here
         // rather than leaking the encrypted blob to managers/workers.
         const isOwner = req.user.role === 'owner';
-        // Attach branch assignments
-        const enriched = await Promise.all(staff.map(async (u) => {
-            const branches = await UserBranch.find({ user_id: u._id }).populate('branch_id', 'name branch_code');
-            const obj = { ...u.toObject(), branches: branches.map((b) => b.branch_id) };
+        // Branch assignments for the whole list in one query, grouped by user. This was a
+        // populate() call per staff member inside staff.map(async …) — a business with 40 staff
+        // issued 40 round trips to render one page.
+        const allLinks = await UserBranch.find({ user_id: { $in: staff.map((u) => u._id) } })
+            .populate('branch_id', 'name branch_code')
+            .lean();
+        const branchesByUser = new Map();
+        for (const link of allLinks) {
+            const key = String(link.user_id);
+            if (!branchesByUser.has(key))
+                branchesByUser.set(key, []);
+            branchesByUser.get(key).push(link.branch_id);
+        }
+        const enriched = staff.map((u) => {
+            const obj = { ...u, branches: branchesByUser.get(String(u._id)) ?? [] };
             obj.pin = isOwner && obj.pin_encrypted ? decryptPin(obj.pin_encrypted) : null;
             delete obj.pin_encrypted;
             return obj;
-        }));
+        });
         res.json(enriched);
     }
     catch (err) {
@@ -113,7 +141,7 @@ router.post('/', authorizeRoles('owner'), async (req, res) => {
             return res.status(400).json({ message: 'Select at least one branch' });
         if (role && role !== 'manager' && role !== 'worker')
             return res.status(400).json({ message: 'Invalid staff type' });
-        const existing = await User.findOne({ phone, deleted_at: null });
+        const existing = await User.findOne({ phone, deleted_at: null }).select('_id').lean();
         if (existing)
             return res.status(400).json({ message: 'Phone number already in use' });
         const password_hash = await randomUnusedPasswordHash();
@@ -174,15 +202,26 @@ router.put('/:id', authorizeRoles('owner'), async (req, res) => {
         if (name)
             staff.name = name;
         if (phone && phone !== staff.phone) {
-            const conflict = await User.findOne({ phone, deleted_at: null, _id: { $ne: staff._id } });
+            const conflict = await User.findOne({ phone, deleted_at: null, _id: { $ne: staff._id } }).select('_id').lean();
             if (conflict)
                 return res.status(400).json({ message: 'Phone number already in use' });
             staff.phone = phone;
         }
         if (pin)
             staff.pin_encrypted = encryptPin(String(pin));
-        if (is_active !== undefined)
+        // Re-enabling has to clear the lockout state too. The escalation in auth.ts leaves a
+        // disabled account with failed_login_count at 30 and, without this, the owner flips the
+        // toggle back on only for the member's next mistyped PIN to disable them again instantly.
+        if (is_active !== undefined) {
+            if (is_active === true && !staff.is_active) {
+                staff.failed_login_count = 0;
+                staff.locked_until = null;
+            }
             staff.is_active = is_active;
+        }
+        // Anything that changes what this person can do, or how they authenticate, must end
+        // their existing sessions rather than wait up to 7 days for the cookie to expire.
+        const mustReauthenticate = (!!role && role !== staff.role) || !!pin || is_active === false;
         // Handle role change + employee ID
         if (role && role !== staff.role) {
             staff.role = role;
@@ -193,13 +232,24 @@ router.put('/:id', authorizeRoles('owner'), async (req, res) => {
                 staff.employee_id = null;
             }
         }
-        staff.updatedAt = DateTime.now().toUTC().toISO();
+        staff.updatedAt = DateTime.now().toUTC().toJSDate();
         await staff.save();
         if (branch_ids !== undefined) {
             await UserBranch.deleteMany({ user_id: staff._id });
             if (branch_ids.length) {
                 await UserBranch.insertMany(branch_ids.map((bid) => ({ user_id: staff._id, branch_id: bid })));
             }
+        }
+        // After the save, so a failed write can't sign someone out for a change that never landed.
+        if (mustReauthenticate) {
+            await invalidateUserSessions(staff._id, req.sessionStore);
+        }
+        else {
+            // Not every edit ends the session — reassigning branches doesn't — but it still changes
+            // what this person can see, and sessionVerification reads that from a cache. Evict it
+            // so the new assignment applies on their very next request rather than up to a minute
+            // later. invalidateUserSessions already does this on the paths that go through it.
+            await invalidateUserContext(staff._id);
         }
         res.json({
             ...staff.toObject(),
@@ -230,10 +280,14 @@ router.delete('/:id', authorizeRoles('owner'), async (req, res) => {
             old_details: staff.toObject(),
             archived_by: req.user.id,
         });
-        staff.deleted_at = DateTime.now().toUTC().toISO();
+        staff.deleted_at = DateTime.now().toUTC().toJSDate();
         staff.is_active = false;
         await staff.save();
         await UserBranch.deleteMany({ user_id: staff._id });
+        // sessionVerification already rejects a soft-deleted user on their next request, so this
+        // is mainly to clear their ActiveSession rows rather than leave them counting against the
+        // device limit until the 7-day TTL.
+        await invalidateUserSessions(staff._id, req.sessionStore);
         res.json({ message: 'Staff removed successfully' });
     }
     catch (err) {

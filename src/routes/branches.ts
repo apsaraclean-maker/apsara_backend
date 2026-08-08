@@ -1,9 +1,10 @@
 import { Router } from 'express';
-import mongoose from 'mongoose';
 import { DateTime } from 'luxon';
+import mongoose from 'mongoose';
 import { Branch, BranchService, UserBranch, Service, User, Order, OrderRating } from '../models.js';
 import { sessionVerification, authorizeRoles, getAccessibleBranchIds, type AuthRequest } from '../middleware/auth.js';
 import { nowInBusinessTz } from '../utils/timezone.js';
+import { invalidateUserContexts } from '../utils/authCache.js';
 
 const router = Router();
 router.use(sessionVerification);
@@ -77,45 +78,100 @@ router.get('/', async (req: AuthRequest, res) => {
     let branches;
 
     if (role === 'owner') {
-      branches = await Branch.find({ business_id: businessId, deleted_at: null }).sort({ createdAt: -1 });
+      branches = await Branch.find({ business_id: businessId, deleted_at: null }).sort({ createdAt: -1 }).lean();
     } else {
-      // Managers and workers see only their assigned branches
-      const assignments = await UserBranch.find({ user_id: req.user!.id }).select('branch_id');
-      const branchIds = assignments.map((a) => a.branch_id);
-      branches = await Branch.find({ _id: { $in: branchIds }, deleted_at: null }).sort({ createdAt: -1 });
+      // Managers and workers see only their assigned branches. The assignment list already
+      // rode in on the session context (see middleware/auth.ts), so this no longer costs its
+      // own round trip.
+      const accessible = await getAccessibleBranchIds(req.user!);
+      branches = await Branch.find({
+        _id: { $in: (accessible ?? []).map((id) => new mongoose.Types.ObjectId(id)) },
+        deleted_at: null,
+      })
+        .sort({ createdAt: -1 })
+        .lean();
     }
 
     // Attach service + staff counts, plus the Branch Card's "Revenue & Orders" tag
     // (current calendar month, mirroring /dashboard/stats' convention of filtering by
     // createdAt window + current status rather than a point-in-time history join).
-    const monthStart = nowInBusinessTz().startOf('month').toUTC().toISO()!;
-    const enriched = await Promise.all(
-      branches.map(async (b) => {
-        const [serviceCount, staffCount, revenueAgg, orderCount, ratingAgg] = await Promise.all([
-          BranchService.countDocuments({ branch_id: b._id }),
-          UserBranch.countDocuments({ branch_id: b._id }),
-          Order.aggregate([
-            { $match: { branch_id: b._id, status: 'paid', createdAt: { $gte: monthStart } } },
-            { $group: { _id: null, total: { $sum: '$total_price' } } },
-          ]),
-          Order.countDocuments({ branch_id: b._id, deleted_at: null, createdAt: { $gte: monthStart } }),
-          OrderRating.aggregate([
-            { $lookup: { from: 'orders', localField: 'order_id', foreignField: '_id', as: 'order' } },
-            { $unwind: '$order' },
-            { $match: { 'order.branch_id': new mongoose.Types.ObjectId(b._id as any), submitted_at: { $ne: null } } },
-            { $group: { _id: null, avg: { $avg: '$overall_rating' } } },
-          ]),
-        ]);
-        return {
-          ...b.toObject(),
-          service_count: serviceCount,
-          staff_count: staffCount,
-          monthly_revenue: revenueAgg[0]?.total || 0,
-          monthly_orders: orderCount,
-          rating: ratingAgg[0]?.avg ? Math.round(ratingAgg[0].avg * 10) / 10 : null,
-        };
-      })
-    );
+    //
+    // Four aggregates for the whole list, grouped by branch. This used to run five queries
+    // per branch inside branches.map(async …), so ten branches meant fifty round trips.
+    // The rating one was the expensive part: it started from OrderRating and $lookup'd the
+    // entire orders collection, once per branch, with nothing indexable to narrow it. It's
+    // inverted here to start from Order — where branch_id is indexed — so the $lookup runs
+    // against the already-narrowed set and rides OrderRating's unique order_id index.
+    const monthStart = nowInBusinessTz().startOf('month').toJSDate();
+    const branchIds = branches.map((b) => b._id);
+
+    const [serviceCounts, staffCounts, monthlyAgg, ratingAgg] = await Promise.all([
+      BranchService.aggregate<{ _id: any; count: number }>([
+        { $match: { branch_id: { $in: branchIds } } },
+        { $group: { _id: '$branch_id', count: { $sum: 1 } } },
+      ]),
+      UserBranch.aggregate<{ _id: any; count: number }>([
+        { $match: { branch_id: { $in: branchIds } } },
+        { $group: { _id: '$branch_id', count: { $sum: 1 } } },
+      ]),
+      // Revenue and order count in one pass. The two used to disagree about soft-deleted
+      // orders — revenue counted them, the order count didn't — so the $cond arms preserve
+      // each one's original filter exactly rather than quietly changing either number.
+      Order.aggregate<{ _id: any; revenue: number; orders: number }>([
+        { $match: { branch_id: { $in: branchIds }, createdAt: { $gte: monthStart } } },
+        {
+          $group: {
+            _id: '$branch_id',
+            revenue: { $sum: { $cond: [{ $eq: ['$status', 'paid'] }, '$total_price', 0] } },
+            orders: { $sum: { $cond: [{ $eq: ['$deleted_at', null] }, 1, 0] } },
+          },
+        },
+      ]),
+      // Inverted relative to the revenue rollup: this one starts from the *ratings* side,
+      // narrowed by the indexed submitted_at, and joins back to orders to pick up branch_id.
+      //
+      // Starting from Order meant matching every order these branches had ever taken — with
+      // no date bound at all — and running a $lookup into orderratings for each one, purely
+      // to discover that the overwhelming majority have no rating. Submitted ratings are a
+      // small fraction of orders, so entering from that side does a fraction of the work.
+      OrderRating.aggregate<{ _id: any; avg: number }>([
+        { $match: { submitted_at: { $ne: null } } },
+        {
+          $lookup: {
+            from: 'orders',
+            localField: 'order_id',
+            foreignField: '_id',
+            as: 'order',
+            pipeline: [
+              { $match: { branch_id: { $in: branchIds } } },
+              { $project: { branch_id: 1 } },
+            ],
+          },
+        },
+        { $unwind: '$order' },
+        { $group: { _id: '$order.branch_id', avg: { $avg: '$overall_rating' } } },
+      ]),
+    ]);
+
+    const byId = <T extends { _id: any }>(rows: T[]) => new Map(rows.map((r) => [String(r._id), r]));
+    const serviceById = byId(serviceCounts);
+    const staffById = byId(staffCounts);
+    const monthlyById = byId(monthlyAgg);
+    const ratingById = byId(ratingAgg);
+
+    const enriched = branches.map((b) => {
+      const key = String(b._id);
+      const monthly = monthlyById.get(key);
+      const avg = ratingById.get(key)?.avg;
+      return {
+        ...b,
+        service_count: serviceById.get(key)?.count ?? 0,
+        staff_count: staffById.get(key)?.count ?? 0,
+        monthly_revenue: monthly?.revenue ?? 0,
+        monthly_orders: monthly?.orders ?? 0,
+        rating: avg ? Math.round(avg * 10) / 10 : null,
+      };
+    });
 
     res.json(enriched);
   } catch (err: any) {
@@ -126,7 +182,7 @@ router.get('/', async (req: AuthRequest, res) => {
 // GET /api/branches/:id
 router.get('/:id', async (req: AuthRequest, res) => {
   try {
-    const branch = await Branch.findOne({ _id: req.params.id, business_id: req.user!.businessId, deleted_at: null });
+    const branch = await Branch.findOne({ _id: req.params.id, business_id: req.user!.businessId, deleted_at: null }).lean();
     if (!branch) return res.status(404).json({ message: 'Branch not found' });
 
     const accessible = await getAccessibleBranchIds(req.user!);
@@ -135,11 +191,11 @@ router.get('/:id', async (req: AuthRequest, res) => {
     }
 
     const [services, staff] = await Promise.all([
-      BranchService.find({ branch_id: branch._id }).populate('service_id'),
-      UserBranch.find({ branch_id: branch._id }).populate('user_id', '-password_hash -pin_encrypted'),
+      BranchService.find({ branch_id: branch._id }).populate('service_id').lean(),
+      UserBranch.find({ branch_id: branch._id }).populate('user_id', '-password_hash -pin_encrypted').lean(),
     ]);
 
-    res.json({ ...branch.toObject(), services, staff });
+    res.json({ ...branch, services, staff });
   } catch (err: any) {
     res.status(500).json({ message: err.message });
   }
@@ -177,6 +233,8 @@ router.post('/', authorizeRoles('owner'), async (req: AuthRequest, res) => {
       await UserBranch.insertMany(
         staff_ids.map((uid: string) => ({ user_id: uid, branch_id: branch._id }))
       );
+      // Their accessible-branch set just widened; drop the cached copy.
+      await invalidateUserContexts(staff_ids);
     }
 
     res.status(201).json(branch);
@@ -205,7 +263,7 @@ router.put('/:id', authorizeRoles('owner'), async (req: AuthRequest, res) => {
     if (state !== undefined) branch.state = state;
     if (latitude !== undefined) branch.latitude = latitude;
     if (longitude !== undefined) branch.longitude = longitude;
-    branch.updatedAt = DateTime.now().toUTC().toISO()!;
+    branch.updatedAt = DateTime.now().toUTC().toJSDate();
     await branch.save();
 
     res.json(branch);
@@ -230,40 +288,70 @@ router.delete('/:id', authorizeRoles('owner'), async (req: AuthRequest, res) => 
       return res.status(400).json({ message: 'A business must have at least one branch — create another branch before deleting this one.' });
     }
 
-    branch.deleted_at = DateTime.now().toUTC().toISO()!;
+    const now = DateTime.now().toUTC().toJSDate();
+    branch.deleted_at = now;
     await branch.save();
 
-    // PRD: "All orders connected to this branch also gets deleted." Soft-deletes them
-    // (deleted_at, same as the single-order DELETE route) rather than hard-deleting, so
-    // they're still swept by Phase 8's eventual 3-month hard-delete purge job — consistent
-    // with every other delete in this app, and avoids losing the audit trail immediately.
-    await Order.updateMany(
-      { branch_id: branch._id, business_id: req.user!.businessId, deleted_at: null },
-      { deleted_at: DateTime.now().toUTC().toISO() }
-    );
+    // Collect what's linked before the links are removed. Both reads and the order cascade
+    // are independent of one another.
+    const [affectedServiceLinks, affectedStaffLinks] = await Promise.all([
+      BranchService.find({ branch_id: branch._id }).select('service_id').lean(),
+      UserBranch.find({ branch_id: branch._id }).select('user_id').lean(),
+      // PRD: "All orders connected to this branch also gets deleted." Soft-deletes them
+      // (deleted_at, same as the single-order DELETE route) rather than hard-deleting, so
+      // they're still swept by Phase 8's eventual 3-month hard-delete purge job — consistent
+      // with every other delete in this app, and avoids losing the audit trail immediately.
+      Order.updateMany(
+        { branch_id: branch._id, business_id: req.user!.businessId, deleted_at: null },
+        { deleted_at: now }
+      ),
+    ]);
+    const affectedServiceIds = affectedServiceLinks.map((l) => l.service_id);
+    const affectedStaffIds = affectedStaffLinks.map((l) => l.user_id);
 
     // PRD: "the link of staff and service to this branch gets disconnected."
-    const affectedServiceLinks = await BranchService.find({ branch_id: branch._id }).select('service_id');
-    const affectedServiceIds = affectedServiceLinks.map((l) => l.service_id);
-    const affectedStaffLinks = await UserBranch.find({ branch_id: branch._id }).select('user_id');
-    const affectedStaffIds = affectedStaffLinks.map((l) => l.user_id);
-    await BranchService.deleteMany({ branch_id: branch._id });
-    await UserBranch.deleteMany({ branch_id: branch._id });
+    await Promise.all([
+      BranchService.deleteMany({ branch_id: branch._id }),
+      UserBranch.deleteMany({ branch_id: branch._id }),
+    ]);
 
     // Services/staff left with zero remaining branch links get disabled until re-linked
     // (both PRD edge cases — Services Page's and Staff Page's — are the same cascade).
-    for (const serviceId of affectedServiceIds) {
-      const remaining = await BranchService.countDocuments({ service_id: serviceId });
-      if (remaining === 0) {
-        await Service.findByIdAndUpdate(serviceId, { is_active: false, updatedAt: DateTime.now().toUTC().toISO() });
-      }
-    }
-    for (const userId of affectedStaffIds) {
-      const remaining = await UserBranch.countDocuments({ user_id: userId });
-      if (remaining === 0) {
-        await User.findByIdAndUpdate(userId, { is_active: false, updatedAt: DateTime.now().toUTC().toISO() });
-      }
-    }
+    //
+    // This was a countDocuments per affected service and per affected user, each awaited in
+    // turn, followed by an individual update for every one that came back zero: deleting a
+    // branch with 30 services and 20 staff cost 50 sequential round trips before any update
+    // ran. Two grouped reads now say which ids still have links anywhere, and the complement
+    // is disabled in a single updateMany each.
+    const [remainingServiceLinks, remainingStaffLinks] = await Promise.all([
+      BranchService.aggregate<{ _id: any }>([
+        { $match: { service_id: { $in: affectedServiceIds } } },
+        { $group: { _id: '$service_id' } },
+      ]),
+      UserBranch.aggregate<{ _id: any }>([
+        { $match: { user_id: { $in: affectedStaffIds } } },
+        { $group: { _id: '$user_id' } },
+      ]),
+    ]);
+
+    const stillLinkedServices = new Set(remainingServiceLinks.map((r) => String(r._id)));
+    const orphanedServiceIds = affectedServiceIds.filter((id) => !stillLinkedServices.has(String(id)));
+    const stillLinkedStaff = new Set(remainingStaffLinks.map((r) => String(r._id)));
+    const orphanedStaffIds = affectedStaffIds.filter((id) => !stillLinkedStaff.has(String(id)));
+
+    await Promise.all([
+      orphanedServiceIds.length
+        ? Service.updateMany({ _id: { $in: orphanedServiceIds } }, { is_active: false, updatedAt: now })
+        : Promise.resolve(),
+      orphanedStaffIds.length
+        ? User.updateMany({ _id: { $in: orphanedStaffIds } }, { is_active: false, updatedAt: now })
+        : Promise.resolve(),
+    ]);
+
+    // Every staff member who was linked here just had their accessible-branch set change, and
+    // for the orphaned ones their active flag too — both are cached by sessionVerification,
+    // so the cache has to be dropped or they'd keep the old view for up to a minute.
+    await invalidateUserContexts(affectedStaffIds);
 
     res.json({ message: 'Branch deleted successfully' });
   } catch (err: any) {
@@ -292,7 +380,7 @@ router.get('/:id/services', async (req: AuthRequest, res) => {
     if (!(await verifyBranchAccess(req, req.params.id))) {
       return res.status(403).json({ message: 'Access to this branch is not permitted' });
     }
-    const links = await BranchService.find({ branch_id: req.params.id }).populate('service_id');
+    const links = await BranchService.find({ branch_id: req.params.id }).populate('service_id').lean();
     res.json(links.map((l) => l.service_id));
   } catch (err: any) {
     res.status(500).json({ message: err.message });
@@ -339,10 +427,9 @@ router.get('/:id/staff', async (req: AuthRequest, res) => {
     if (!(await verifyBranchAccess(req, req.params.id))) {
       return res.status(403).json({ message: 'Access to this branch is not permitted' });
     }
-    const links = await UserBranch.find({ branch_id: req.params.id }).populate(
-      'user_id',
-      '-password_hash -pin_encrypted'
-    );
+    const links = await UserBranch.find({ branch_id: req.params.id })
+      .populate('user_id', '-password_hash -pin_encrypted')
+      .lean();
     res.json(links.map((l) => l.user_id));
   } catch (err: any) {
     res.status(500).json({ message: err.message });
@@ -362,6 +449,7 @@ router.post('/:id/staff/:userId', authorizeRoles('owner'), async (req: AuthReque
       { user_id: req.params.userId, branch_id: req.params.id },
       { upsert: true }
     );
+    await invalidateUserContexts([req.params.userId]);
     res.json({ message: 'Staff linked to branch' });
   } catch (err: any) {
     res.status(500).json({ message: err.message });
@@ -375,6 +463,7 @@ router.delete('/:id/staff/:userId', authorizeRoles('owner'), async (req: AuthReq
     if (!branch) return res.status(404).json({ message: 'Branch not found' });
 
     await UserBranch.deleteOne({ user_id: req.params.userId, branch_id: req.params.id });
+    await invalidateUserContexts([req.params.userId]);
     res.json({ message: 'Staff unlinked from branch' });
   } catch (err: any) {
     res.status(500).json({ message: err.message });

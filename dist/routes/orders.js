@@ -6,10 +6,12 @@ import { fileURLToPath } from 'url';
 import multer from 'multer';
 import mongoose from 'mongoose';
 import crypto from 'crypto';
+import sharp from 'sharp';
 import { Order, OrderService, OrderImage, OrderStatusHistory, OrderRating, OrderDailyCounter, Service, Branch, User, } from '../models.js';
 import { sessionVerification, authorizeRoles, getAccessibleBranchIds } from '../middleware/auth.js';
 import { buildWhatsAppMessage } from '../services/whatsapp.js';
-import { delayedMatchCondition } from '../utils/orderDelay.js';
+import { computeIsDelayed, delayedMatchCondition } from '../utils/orderDelay.js';
+import { buildSearchRegex } from '../utils/searchRegex.js';
 import { nowInBusinessTz, parseDateInBusinessTz } from '../utils/timezone.js';
 // True if the caller (already business-scoped by whatever lookup found `order`) is also
 // allowed to touch this specific order's branch (owners are unrestricted; managers/workers
@@ -77,13 +79,16 @@ router.get('/rate/:token', async (req, res) => {
         // browsable (and rateable) indefinitely. Reuses the same "not found or expired" message
         // as a missing token so a deleted order isn't distinguishable from a bad link.
         const order = await Order.findOne({ _id: rating.order_id, deleted_at: null })
-            .populate('branch_id', 'name')
-            .populate('business_id', 'name');
+            .populate('branch_id', 'name address_line_1 address_line_2 city state pincode')
+            // The invoice header prints the shop's address and phone under its name, so the
+            // whole block travels with the order rather than just the name.
+            .populate('business_id', 'name address state pincode phone')
+            .lean();
         if (!order)
             return res.status(404).json({ message: 'Rating link not found or expired' });
-        const items = await OrderService.find({ order_id: order._id });
+        const items = await OrderService.find({ order_id: order._id }).lean();
         res.json({
-            order: { ...order.toObject(), items },
+            order: { ...order, items },
             rating: {
                 submitted: rating.submitted_at !== null,
                 overall_rating: rating.overall_rating,
@@ -118,7 +123,7 @@ router.post('/rate/:token', async (req, res) => {
         rating.overall_rating = overall_rating;
         rating.speed_rating = speed_rating;
         rating.quality_rating = quality_rating;
-        rating.submitted_at = DateTime.now().toUTC().toISO();
+        rating.submitted_at = DateTime.now().toUTC().toJSDate();
         await rating.save();
         res.json({ message: 'Thank you for your rating!' });
     }
@@ -180,9 +185,36 @@ router.get('/', async (req, res) => {
             if (max_price)
                 match.total_price.$lte = Number(max_price);
         }
+        // Correlated sub-pipeline stages, appended after the tenant-scoped $match below so they
+        // only ever run against orders this caller can already see.
+        //
+        // These replace three `.distinct()` calls that each queried a whole collection with no
+        // business scope of their own and fed the result into `{ _id: { $in: [...] } }`. That was
+        // wrong in two ways at once: the scan was global (every business's rows), and the $in
+        // array it produced was unbounded — on a busy month it could carry tens of thousands of
+        // ObjectIds into the next query. Correlating on order_id instead keeps the work
+        // proportional to the page being asked for, and rides the indexes on each collection.
+        const correlatedStages = [];
+        const correlatedMatch = {};
         if (service_id) {
-            const orderIdsWithService = await OrderService.find({ service_id: service_id }).distinct('order_id');
-            match._id = { $in: orderIdsWithService };
+            correlatedStages.push({
+                $lookup: {
+                    from: 'orderservices',
+                    let: { oid: '$_id' },
+                    pipeline: [
+                        {
+                            $match: {
+                                service_id: new mongoose.Types.ObjectId(service_id),
+                                $expr: { $eq: ['$order_id', '$$oid'] },
+                            },
+                        },
+                        { $limit: 1 },
+                        { $project: { _id: 1 } },
+                    ],
+                    as: 'service_match',
+                },
+            });
+            correlatedMatch.service_match = { $ne: [] };
         }
         const accessibleBranchIds = await getAccessibleBranchIds(req.user);
         if (accessibleBranchIds === null) {
@@ -202,6 +234,34 @@ router.get('/', async (req, res) => {
         // in the window (per the PRD's Order Quickview date-range semantics) — combined with
         // `search` via a top-level $and since both need their own $or.
         const andConditions = [];
+        // Correlated history lookup, shared by both the timeline click-through and the generic
+        // date-range filter. `statuses` narrows to a single transition type for timeline mode;
+        // the generic filter accepts any transition in the window.
+        const addHistoryLookup = (from, to, statuses) => {
+            const changedAt = {};
+            if (from)
+                changedAt.$gte = from;
+            if (to)
+                changedAt.$lte = to;
+            correlatedStages.push({
+                $lookup: {
+                    from: 'orderstatushistories',
+                    let: { oid: '$_id' },
+                    pipeline: [
+                        {
+                            $match: {
+                                ...(statuses ? { status: { $in: statuses } } : {}),
+                                ...(Object.keys(changedAt).length ? { changed_at: changedAt } : {}),
+                                $expr: { $eq: ['$order_id', '$$oid'] },
+                            },
+                        },
+                        { $limit: 1 },
+                        { $project: { _id: 1 } },
+                    ],
+                    as: 'history_match',
+                },
+            });
+        };
         if (timelineMode) {
             // Replicate the Order Timeline cell's exact counting semantics (see
             // dashboard.ts GET /timeline) for a single business-day so the resulting list
@@ -211,8 +271,8 @@ router.get('/', async (req, res) => {
             //   completed → a 'completed' history entry that day, still completed-or-paid now
             //   paid      → a 'paid' history entry that day, still paid now
             //   cancelled → a 'cancelled' history entry that day (terminal)
-            const dayStart = parseDateInBusinessTz(timeline_date).startOf('day').toUTC().toISO();
-            const dayEnd = parseDateInBusinessTz(timeline_date).endOf('day').toUTC().toISO();
+            const dayStart = parseDateInBusinessTz(timeline_date).startOf('day').toJSDate();
+            const dayEnd = parseDateInBusinessTz(timeline_date).endOf('day').toJSDate();
             const ts = timeline_status;
             if (ts === 'created') {
                 match.status = { $ne: 'cancelled' };
@@ -223,11 +283,8 @@ router.get('/', async (req, res) => {
                 andConditions.push({ delivery_due_date: { $gte: dayStart, $lte: dayEnd } });
             }
             else if (ts === 'completed' || ts === 'paid' || ts === 'cancelled') {
-                const orderIds = await OrderStatusHistory.find({
-                    status: ts,
-                    changed_at: { $gte: dayStart, $lte: dayEnd },
-                }).distinct('order_id');
-                andConditions.push({ _id: { $in: orderIds } });
+                addHistoryLookup(dayStart, dayEnd, [ts]);
+                correlatedMatch.history_match = { $ne: [] };
                 if (ts === 'completed')
                     match.status = { $in: ['completed', 'paid'] };
                 else
@@ -235,55 +292,96 @@ router.get('/', async (req, res) => {
             }
         }
         else if (start_date || end_date) {
+            // Day boundaries are resolved in IST rather than by pasting a 'Z' suffix onto the raw
+            // parameter. The old `${end_date}T23:59:59.999Z` cut the window at 05:29 IST the
+            // following morning, so a late-evening order fell outside the day it was placed on.
+            const from = start_date ? parseDateInBusinessTz(start_date).startOf('day').toJSDate() : null;
+            const to = end_date ? parseDateInBusinessTz(end_date).endOf('day').toJSDate() : null;
             const dateRange = {};
-            if (start_date)
-                dateRange.$gte = start_date;
-            if (end_date)
-                dateRange.$lte = `${end_date}T23:59:59.999Z`;
-            const historyRange = { changed_at: {} };
-            if (start_date)
-                historyRange.changed_at.$gte = start_date;
-            if (end_date)
-                historyRange.changed_at.$lte = `${end_date}T23:59:59.999Z`;
-            const orderIdsWithHistoryInRange = await OrderStatusHistory.find(historyRange).distinct('order_id');
+            if (from)
+                dateRange.$gte = from;
+            if (to)
+                dateRange.$lte = to;
+            addHistoryLookup(from, to, null);
             andConditions.push({
                 $or: [
                     { createdAt: dateRange },
                     { delivery_due_date: dateRange },
-                    { _id: { $in: orderIdsWithHistoryInRange } },
+                    { history_match: { $ne: [] } },
                 ],
             });
         }
-        if (search) {
-            const escaped = search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const searchRe = buildSearchRegex(search);
+        if (searchRe) {
             andConditions.push({
                 $or: [
-                    { customer_name: { $regex: escaped, $options: 'i' } },
-                    { order_number: { $regex: escaped, $options: 'i' } },
-                    { customer_mobile: { $regex: escaped, $options: 'i' } },
+                    { customer_name: searchRe },
+                    { order_number: searchRe },
+                    { customer_mobile: searchRe },
                 ],
             });
         }
-        // "Delayed only" filter — matches the frontend's isOrderDelayed() fallback to a live
-        // due-date comparison, not just the is_delayed flag (which nothing in the app ever
-        // actually sets via its own PATCH route, so filtering on it alone always returned empty).
+        // "Delayed only" filter. is_delayed is now maintained as a real stored value (see
+        // utils/orderDelay.ts), so this is an indexed equality rather than the unindexable
+        // three-armed $or — ending in an $expr field-to-field comparison — that it used to be.
         if (is_delayed === 'true') {
-            andConditions.push(delayedMatchCondition(DateTime.now().toUTC().toISO()));
+            Object.assign(match, delayedMatchCondition());
         }
-        if (andConditions.length)
-            match.$and = andConditions;
         // Orders Grid View defaults to "latest interacted" (most recently updated) per the
         // PRD, distinct from Order Quickview's created-date sort.
         const sortSpec = sort === 'updated_desc' ? { updatedAt: -1 } : { createdAt: -1 };
-        const [orders, total] = await Promise.all([
-            Order.find(match)
-                .populate('branch_id', 'name branch_code')
-                .populate('created_by', 'name role')
-                .sort(sortSpec)
-                .skip(skip)
-                .limit(limitNum),
-            Order.countDocuments(match),
+        // One pass instead of two. The rows and the total previously ran as separate queries over
+        // the same predicate, so every filtered page evaluated that predicate twice — and with a
+        // regex search or the date-range $or in play, twice over a set that no index could fully
+        // narrow. $facet forks the already-filtered stream, and the branch/creator lookups sit
+        // inside the rows branch *after* $skip/$limit so they only resolve the page being sent.
+        const [faceted] = await Order.aggregate([
+            { $match: match },
+            ...correlatedStages,
+            ...(Object.keys(correlatedMatch).length ? [{ $match: correlatedMatch }] : []),
+            ...(andConditions.length ? [{ $match: { $and: andConditions } }] : []),
+            // $sort sits *outside* the $facet deliberately. A $facet sub-pipeline cannot use an
+            // index, so sorting inside one would force a blocking in-memory sort of the whole
+            // matched set on every page load — the exact failure mode the new
+            // {business_id, deleted_at, branch_id, createdAt} / {…, updatedAt} indexes exist to
+            // avoid. Immediately after $match it is index-backed, and the facet then consumes an
+            // already-ordered stream.
+            { $sort: sortSpec },
+            {
+                $facet: {
+                    rows: [
+                        { $skip: skip },
+                        { $limit: limitNum },
+                        { $project: { service_match: 0, history_match: 0 } },
+                        {
+                            $lookup: {
+                                from: 'branches',
+                                localField: 'branch_id',
+                                foreignField: '_id',
+                                as: 'branch_id',
+                                pipeline: [{ $project: { name: 1, branch_code: 1 } }],
+                            },
+                        },
+                        {
+                            $lookup: {
+                                from: 'users',
+                                localField: 'created_by',
+                                foreignField: '_id',
+                                as: 'created_by',
+                                pipeline: [{ $project: { name: 1, role: 1 } }],
+                            },
+                        },
+                        // $lookup always yields an array; populate() yielded a single document or null,
+                        // and the frontend reads order.branch_id.name directly. Unwind back to that shape.
+                        { $unwind: { path: '$branch_id', preserveNullAndEmptyArrays: true } },
+                        { $unwind: { path: '$created_by', preserveNullAndEmptyArrays: true } },
+                    ],
+                    total: [{ $count: 'count' }],
+                },
+            },
         ]);
+        const orders = faceted?.rows ?? [];
+        const total = faceted?.total?.[0]?.count ?? 0;
         // Order Timeline (Calendar View) needs each order's full status history to draw its
         // timeline bar. One bulk query for the page's orders, grouped by order_id (asc by time),
         // instead of an N+1 per-card lookup.
@@ -291,7 +389,8 @@ router.get('/', async (req, res) => {
         if (include_history === 'true') {
             const histories = await OrderStatusHistory.find({ order_id: { $in: orders.map((o) => o._id) } })
                 .select('order_id status changed_at')
-                .sort({ changed_at: 1 });
+                .sort({ changed_at: 1 })
+                .lean();
             historyByOrder = histories.reduce((acc, h) => {
                 const key = String(h.order_id);
                 (acc[key] ||= []).push({ status: h.status, changed_at: h.changed_at });
@@ -299,21 +398,41 @@ router.get('/', async (req, res) => {
             }, {});
         }
         // Attach line items + image count + rating (PRD: Order Card shows the customer
-        // rating once the order is paid and the customer has submitted one)
-        const enriched = await Promise.all(orders.map(async (o) => {
-            const [items, imageCount, rating] = await Promise.all([
-                OrderService.find({ order_id: o._id }),
-                OrderImage.countDocuments({ order_id: o._id }),
-                OrderRating.findOne({ order_id: o._id }).select('overall_rating submitted_at'),
-            ]);
+        // rating once the order is paid and the customer has submitted one).
+        //
+        // Three batched queries for the whole page rather than three per order. This ran inside
+        // orders.map(async …) before, so a default page cost 60 round trips and a full 200-card
+        // Quickview cost 600. Same $in-and-group shape the status-history block above already
+        // uses — all three collections are indexed on order_id, so each is one indexed scan.
+        const orderIds = orders.map((o) => o._id);
+        const [allItems, imageCounts, ratings] = await Promise.all([
+            OrderService.find({ order_id: { $in: orderIds } }).lean(),
+            OrderImage.aggregate([
+                { $match: { order_id: { $in: orderIds } } },
+                { $group: { _id: '$order_id', count: { $sum: 1 } } },
+            ]),
+            OrderRating.find({ order_id: { $in: orderIds } }).select('order_id overall_rating submitted_at').lean(),
+        ]);
+        const itemsByOrder = allItems.reduce((acc, i) => {
+            (acc[String(i.order_id)] ||= []).push(i);
+            return acc;
+        }, {});
+        const imageCountByOrder = new Map(imageCounts.map((r) => [String(r._id), r.count]));
+        const ratingByOrder = new Map(ratings.map((r) => [String(r.order_id), r]));
+        // Plain objects already — the aggregation above skips Mongoose hydration entirely, so
+        // there is no document to .toObject() back out of. On a full 200-card Quickview that
+        // avoided hydrating and then re-serialising 200 orders plus their line items.
+        const enriched = orders.map((o) => {
+            const key = String(o._id);
+            const rating = ratingByOrder.get(key);
             return {
-                ...o.toObject(),
-                items,
-                image_count: imageCount,
+                ...o,
+                items: itemsByOrder[key] ?? [],
+                image_count: imageCountByOrder.get(key) ?? 0,
                 customer_rating: rating?.submitted_at ? rating.overall_rating : null,
-                ...(include_history === 'true' ? { status_history: historyByOrder[String(o._id)] ?? [] } : {}),
+                ...(include_history === 'true' ? { status_history: historyByOrder[key] ?? [] } : {}),
             };
-        }));
+        });
         res.json({ orders: enriched, total, page: parseInt(page), limit: limitNum });
     }
     catch (err) {
@@ -324,22 +443,28 @@ router.get('/', async (req, res) => {
 router.get('/:id', async (req, res) => {
     try {
         const order = await Order.findOne({ _id: req.params.id, business_id: req.user.businessId, deleted_at: null })
-            .populate('branch_id', 'name branch_code')
-            .populate('created_by', 'name role employee_id');
+            // The invoice prints the branch that handled the order, and its address, beneath the
+            // business name — so the branch's address fields travel with the order too.
+            .populate('branch_id', 'name branch_code address_line_1 address_line_2 city state pincode')
+            .populate('created_by', 'name role employee_id')
+            // Needed by the invoice the Order Detail page can download once the order is paid.
+            .populate('business_id', 'name address state pincode phone')
+            .lean();
         if (!order)
             return res.status(404).json({ message: 'Order not found' });
         if (!(await hasOrderBranchAccess(req.user, order))) {
             return res.status(403).json({ message: 'Access to this branch is not permitted' });
         }
         const [items, images, history, rating] = await Promise.all([
-            OrderService.find({ order_id: order._id }),
-            OrderImage.find({ order_id: order._id }).sort({ sort_order: 1 }),
+            OrderService.find({ order_id: order._id }).lean(),
+            OrderImage.find({ order_id: order._id }).sort({ sort_order: 1 }).lean(),
             OrderStatusHistory.find({ order_id: order._id })
                 .populate('changed_by', 'name role')
-                .sort({ changed_at: -1 }),
-            OrderRating.findOne({ order_id: order._id }),
+                .sort({ changed_at: -1 })
+                .lean(),
+            OrderRating.findOne({ order_id: order._id }).lean(),
         ]);
-        res.json({ ...order.toObject(), items, images, history, rating });
+        res.json({ ...order, items, images, history, rating });
     }
     catch (err) {
         res.status(500).json({ message: err.message });
@@ -350,31 +475,49 @@ router.get('/:id', async (req, res) => {
 router.post('/', authorizeRoles('owner', 'manager'), async (req, res) => {
     const { branch_id, customer_name, customer_mobile, items, delivery_due_date, extra_charges, extra_charges_reason, notes } = req.body;
     try {
-        const branch = await Branch.findOne({ _id: branch_id, business_id: req.user.businessId, deleted_at: null });
+        // The branch and the creating user are independent lookups — the creator's id comes off
+        // the verified session, not off the branch — so they resolve together.
+        const [branch, creator] = await Promise.all([
+            Branch.findOne({ _id: branch_id, business_id: req.user.businessId, deleted_at: null }).lean(),
+            User.findById(req.user.id).select('name employee_id').lean(),
+        ]);
         if (!branch)
             return res.status(404).json({ message: 'Branch not found' });
-        const creator = await User.findById(req.user.id).select('name employee_id');
         const employeeId = creator?.employee_id
             || creator?.name?.split(' ').map((w) => w[0]?.toUpperCase() || '').join('').slice(0, 2)
             || 'STF';
+        // Resolve every referenced service in one query rather than one per line item. The
+        // per-item lookup below used to sit inside this loop and be awaited, so a ten-line order
+        // cost ten sequential round trips before a single document was written.
+        //
+        // Scoping is unchanged and still matters: an unscoped findById would resolve any
+        // business's service_id and snapshot its details into this order (a cross-tenant leak),
+        // and the is_active check stops a disabled service being added to a brand-new order via
+        // a stale client cache or a direct API call. Ad-hoc line items carrying no service_id are
+        // unaffected by either.
+        const requestedServiceIds = [...new Set((items || []).filter((i) => i.service_id).map((i) => String(i.service_id)))];
+        const servicesById = new Map();
+        if (requestedServiceIds.length) {
+            const found = await Service.find({
+                _id: { $in: requestedServiceIds },
+                business_id: req.user.businessId,
+                deleted_at: null,
+            }).lean();
+            for (const s of found)
+                servicesById.set(String(s._id), s);
+            if (found.length !== requestedServiceIds.length) {
+                return res.status(400).json({ message: 'One or more selected services could not be found' });
+            }
+            const disabled = found.find((s) => !s.is_active);
+            if (disabled) {
+                return res.status(400).json({ message: `"${disabled.name}" is currently disabled and cannot be added to an order` });
+            }
+        }
         // Build line items
         const orderItems = [];
         let total_price = 0;
         for (const item of items || []) {
-            // Was previously an unscoped Service.findById — no business_id check (a cross-tenant
-            // leak: any business's service_id would resolve and its details would snapshot into
-            // this order) and no is_active check (a disabled service could still be added to a
-            // brand-new order via a stale client cache or a direct API call, defeating the point
-            // of the toggle). Only applies when service_id is actually provided — ad-hoc line
-            // items with no service_id are unaffected.
-            let service = null;
-            if (item.service_id) {
-                service = await Service.findOne({ _id: item.service_id, business_id: req.user.businessId, deleted_at: null });
-                if (!service)
-                    return res.status(400).json({ message: 'One or more selected services could not be found' });
-                if (!service.is_active)
-                    return res.status(400).json({ message: `"${service.name}" is currently disabled and cannot be added to an order` });
-            }
+            const service = item.service_id ? servicesById.get(String(item.service_id)) : null;
             const unit_price = item.unit_price ?? (item.pricing_mode === 'kg' ? (service?.weight_price || 0) : (service?.unit_price || 0));
             const line_total = unit_price * (item.quantity || 1);
             total_price += line_total;
@@ -405,15 +548,21 @@ router.post('/', authorizeRoles('owner', 'manager'), async (req, res) => {
             total_price,
             notes: notes || '',
             status: 'created',
+            // A brand-new order can already be late if it's booked with a due date in the past.
+            is_delayed: computeIsDelayed({ delivery_due_date: delivery_due_date || null, completed_at: null, status: 'created' }),
         });
-        if (orderItems.length) {
-            await OrderService.insertMany(orderItems.map((i) => ({ ...i, order_id: order._id })));
-        }
-        // Create rating token
-        const rating_token = crypto.randomBytes(24).toString('hex');
-        await OrderRating.create({ order_id: order._id, rating_token });
-        // Record initial status history
-        await OrderStatusHistory.create({ order_id: order._id, status: 'created', changed_by: req.user.id });
+        // The three dependent writes below all key off order._id and touch different collections,
+        // so nothing orders them relative to each other — they were simply awaited one after
+        // another. Issued together they cost one round trip instead of three.
+        await Promise.all([
+            orderItems.length
+                ? OrderService.insertMany(orderItems.map((i) => ({ ...i, order_id: order._id })))
+                : Promise.resolve(),
+            // Rating token
+            OrderRating.create({ order_id: order._id, rating_token: crypto.randomBytes(24).toString('hex') }),
+            // Initial status history
+            OrderStatusHistory.create({ order_id: order._id, status: 'created', changed_by: req.user.id }),
+        ]);
         const whatsapp_message = buildWhatsAppMessage('order_created', {
             customer_name,
             order_number,
@@ -447,7 +596,10 @@ router.put('/:id', authorizeRoles('owner', 'manager'), async (req, res) => {
             order.extra_charges_reason = extra_charges_reason;
         if (notes !== undefined)
             order.notes = notes;
-        order.updatedAt = DateTime.now().toUTC().toISO();
+        order.updatedAt = DateTime.now().toUTC().toJSDate();
+        // Editing the due date can move an order into or out of "delayed" — recomputed here
+        // because the flag is stored rather than derived at read time.
+        order.is_delayed = computeIsDelayed(order);
         if (items !== undefined) {
             // Validate every item *before* touching existing OrderService rows — otherwise a
             // mid-loop rejection (disabled/missing service) would leave the order with its old
@@ -457,18 +609,25 @@ router.put('/:id', authorizeRoles('owner', 'manager'), async (req, res) => {
             // already had — disabling a service shouldn't retroactively break editing an existing
             // order that already used it (e.g. just changing the customer name shouldn't fail
             // because a linked service was disabled sometime after this order was created).
-            const existingServiceIds = new Set((await OrderService.find({ order_id: order._id }).select('service_id')).map((i) => String(i.service_id)));
+            // Both lookups are independent of each other, and the service lookup is now a single
+            // $in rather than one awaited query per line item — same fix as the create route.
+            const requestedIds = [...new Set(items.filter((i) => i.service_id).map((i) => String(i.service_id)))];
+            const [existingRows, foundServices] = await Promise.all([
+                OrderService.find({ order_id: order._id }).select('service_id').lean(),
+                requestedIds.length
+                    ? Service.find({ _id: { $in: requestedIds }, business_id: req.user.businessId, deleted_at: null }).lean()
+                    : Promise.resolve([]),
+            ]);
+            const existingServiceIds = new Set(existingRows.map((i) => String(i.service_id)));
             const resolvedServices = new Map();
-            for (const item of items) {
-                if (!item.service_id)
-                    continue;
-                const service = await Service.findOne({ _id: item.service_id, business_id: req.user.businessId, deleted_at: null });
-                if (!service)
-                    return res.status(400).json({ message: 'One or more selected services could not be found' });
-                if (!service.is_active && !existingServiceIds.has(String(item.service_id))) {
-                    return res.status(400).json({ message: `"${service.name}" is currently disabled and cannot be added to an order` });
-                }
-                resolvedServices.set(String(item.service_id), service);
+            for (const s of foundServices)
+                resolvedServices.set(String(s._id), s);
+            if (foundServices.length !== requestedIds.length) {
+                return res.status(400).json({ message: 'One or more selected services could not be found' });
+            }
+            const newlyDisabled = foundServices.find((s) => !s.is_active && !existingServiceIds.has(String(s._id)));
+            if (newlyDisabled) {
+                return res.status(400).json({ message: `"${newlyDisabled.name}" is currently disabled and cannot be added to an order` });
             }
             await OrderService.deleteMany({ order_id: order._id });
             let total_price = order.extra_charges;
@@ -530,7 +689,15 @@ router.patch('/:id/status', authorizeRoles('owner', 'manager'), async (req, res)
         }
         const prev_status = order.status;
         order.status = status;
-        order.updatedAt = DateTime.now().toUTC().toISO();
+        // Reaching "completed" is what the delay rule is measured against, so the moment is
+        // recorded here. Going straight created → paid isn't a legal transition, so `paid`
+        // always arrives with completed_at already set.
+        if (status === 'completed')
+            order.completed_at = DateTime.now().toUTC().toJSDate();
+        order.updatedAt = DateTime.now().toUTC().toJSDate();
+        // Recomputed on every transition: completing an order settles whether it landed late,
+        // and cancelling clears the mark entirely (a called-off order was never missed).
+        order.is_delayed = computeIsDelayed(order);
         await order.save();
         await OrderStatusHistory.create({ order_id: order._id, status, changed_by: req.user.id });
         const whatsapp_message = buildWhatsAppMessage(`order_${status}`, {
@@ -544,17 +711,23 @@ router.patch('/:id/status', authorizeRoles('owner', 'manager'), async (req, res)
         res.status(500).json({ message: err.message });
     }
 });
-// PATCH /api/orders/:id/delayed
+// PATCH /api/orders/:id/delayed — manual override of the delay mark.
+//
+// Now that is_delayed is maintained rather than derived, this write is not permanent: the
+// next status change or due-date edit recomputes the flag from the order's own dates and
+// will overwrite whatever was set here. That's the pre-existing contract of this route
+// preserved as-is (nothing in the UI calls it), not a new limitation — but it's worth
+// knowing before wiring a button to it.
 router.patch('/:id/delayed', authorizeRoles('owner', 'manager'), async (req, res) => {
     const { is_delayed } = req.body;
     try {
-        const existing = await Order.findOne({ _id: req.params.id, business_id: req.user.businessId, deleted_at: null }).select('branch_id');
+        const existing = await Order.findOne({ _id: req.params.id, business_id: req.user.businessId, deleted_at: null }).select('branch_id').lean();
         if (!existing)
             return res.status(404).json({ message: 'Order not found' });
         if (!(await hasOrderBranchAccess(req.user, existing))) {
             return res.status(403).json({ message: 'Access to this branch is not permitted' });
         }
-        const order = await Order.findOneAndUpdate({ _id: req.params.id }, { is_delayed: Boolean(is_delayed), updatedAt: DateTime.now().toUTC().toISO() }, { new: true });
+        const order = await Order.findOneAndUpdate({ _id: req.params.id }, { is_delayed: Boolean(is_delayed), updatedAt: DateTime.now().toUTC().toJSDate() }, { new: true });
         res.json(order);
     }
     catch (err) {
@@ -571,7 +744,7 @@ router.patch('/:id/notes', authorizeRoles('owner', 'manager'), async (req, res) 
         if (!(await hasOrderBranchAccess(req.user, existing))) {
             return res.status(403).json({ message: 'Access to this branch is not permitted' });
         }
-        const order = await Order.findOneAndUpdate({ _id: req.params.id }, { notes: notes || '', updatedAt: DateTime.now().toUTC().toISO() }, { new: true });
+        const order = await Order.findOneAndUpdate({ _id: req.params.id }, { notes: notes || '', updatedAt: DateTime.now().toUTC().toJSDate() }, { new: true });
         res.json(order);
     }
     catch (err) {
@@ -590,7 +763,7 @@ router.delete('/:id', authorizeRoles('owner'), async (req, res) => {
         if (order.status !== 'cancelled') {
             return res.status(400).json({ message: 'Only cancelled orders can be deleted' });
         }
-        order.deleted_at = DateTime.now().toUTC().toISO();
+        order.deleted_at = DateTime.now().toUTC().toJSDate();
         await order.save();
         res.json({ message: 'Order deleted' });
     }
@@ -601,7 +774,7 @@ router.delete('/:id', authorizeRoles('owner'), async (req, res) => {
 // GET /api/orders/:id/history
 router.get('/:id/history', async (req, res) => {
     try {
-        const order = await Order.findOne({ _id: req.params.id, business_id: req.user.businessId, deleted_at: null }).select('branch_id');
+        const order = await Order.findOne({ _id: req.params.id, business_id: req.user.businessId, deleted_at: null }).select('branch_id').lean();
         if (!order)
             return res.status(404).json({ message: 'Order not found' });
         if (!(await hasOrderBranchAccess(req.user, order))) {
@@ -609,7 +782,8 @@ router.get('/:id/history', async (req, res) => {
         }
         const history = await OrderStatusHistory.find({ order_id: req.params.id })
             .populate('changed_by', 'name role')
-            .sort({ changed_at: -1 });
+            .sort({ changed_at: -1 })
+            .lean();
         res.json(history);
     }
     catch (err) {
@@ -631,9 +805,34 @@ router.post('/:id/images', authorizeRoles('owner', 'manager'), upload.array('ima
         if (existingCount + files.length > 5) {
             return res.status(400).json({ message: `Maximum 5 images per order. Already has ${existingCount}.` });
         }
+        // Order cards render these at thumbnail size but were being served the full upload — up
+        // to 5MB each, five per order. A Quickview page of 200 cards could pull tens of megabytes
+        // of image data that the browser then scaled down to a few hundred pixels. Each upload
+        // now also gets a ~400px WebP derivative for list views; the original is untouched and
+        // still what the detail view and the invoice link to.
+        const dir = path.join(uploadsDir, 'orders', `business_${req.user.businessId}`);
+        const thumbs = await Promise.all(files.map(async (f) => {
+            const thumbName = `thumb-${path.parse(f.filename).name}.webp`;
+            try {
+                await sharp(path.join(dir, f.filename))
+                    .rotate() // honour EXIF orientation, which is lost when the image is re-encoded
+                    .resize({ width: 400, withoutEnlargement: true })
+                    .webp({ quality: 80 })
+                    .toFile(path.join(dir, thumbName));
+                return `/uploads/orders/business_${req.user.businessId}/${thumbName}`;
+            }
+            catch (err) {
+                // A thumbnail is an optimisation, not the payload. If sharp can't read this
+                // particular file, keep the upload and let the card fall back to the original
+                // rather than failing a request the user has already waited on.
+                console.error('[orders] thumbnail generation failed (non-fatal):', err.message);
+                return '';
+            }
+        }));
         const images = await OrderImage.insertMany(files.map((f, i) => ({
             order_id: order._id,
             image_url: `/uploads/orders/business_${req.user.businessId}/${f.filename}`,
+            thumb_url: thumbs[i],
             file_size_bytes: f.size,
             sort_order: existingCount + i,
         })));
@@ -655,10 +854,16 @@ router.delete('/:id/images/:imageId', authorizeRoles('owner', 'manager'), async 
         const image = await OrderImage.findOne({ _id: req.params.imageId, order_id: req.params.id });
         if (!image)
             return res.status(404).json({ message: 'Image not found' });
-        const filename = path.basename(image.image_url);
-        const filePath = path.join(uploadsDir, 'orders', `business_${req.user.businessId}`, filename);
-        if (fs.existsSync(filePath))
-            fs.unlinkSync(filePath);
+        // Both the original and its thumbnail, or the derivative outlives the record it belongs
+        // to and quietly accumulates on disk.
+        const dir = path.join(uploadsDir, 'orders', `business_${req.user.businessId}`);
+        for (const url of [image.image_url, image.thumb_url]) {
+            if (!url)
+                continue;
+            const filePath = path.join(dir, path.basename(url));
+            if (fs.existsSync(filePath))
+                fs.unlinkSync(filePath);
+        }
         await OrderImage.deleteOne({ _id: image._id });
         res.json({ message: 'Image deleted' });
     }
@@ -672,13 +877,14 @@ router.get('/:id/invoice', async (req, res) => {
         const order = await Order.findOne({ _id: req.params.id, business_id: req.user.businessId, deleted_at: null })
             .populate('branch_id', 'name branch_code address_line_1 address_line_2 city state pincode')
             .populate('business_id', 'name phone address')
-            .populate('created_by', 'name');
+            .populate('created_by', 'name')
+            .lean();
         if (!order)
             return res.status(404).json({ message: 'Order not found' });
         if (!(await hasOrderBranchAccess(req.user, order))) {
             return res.status(403).json({ message: 'Access to this branch is not permitted' });
         }
-        const items = await OrderService.find({ order_id: order._id });
+        const items = await OrderService.find({ order_id: order._id }).lean();
         res.json({ order, items });
     }
     catch (err) {

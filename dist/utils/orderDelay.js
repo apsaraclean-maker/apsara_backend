@@ -1,31 +1,74 @@
 import { DateTime } from 'luxon';
-// Mirrors Frontend/lib/orderStatus.ts's isOrderDelayed — keep both in sync. An order is
-// delayed if explicitly flagged, or if it has a due date that's passed while the order
-// hasn't reached a terminal-ish state. Previously the backend's delayed count/filter only
-// checked the `is_delayed` flag directly, but nothing in the app ever calls
-// `PATCH /orders/:id/delayed` — so that flag stays false forever for real orders, while the
-// frontend's card display correctly falls back to comparing dates. That meant the Dashboard
-// delayed count and the Orders page's "Delayed only" filter were effectively dead for real
-// data even though the visual indicator worked.
-export const NON_DELAYABLE_STATUSES = ['paid', 'completed', 'cancelled'];
-export function isOrderDelayed(order) {
-    if (order.is_delayed)
-        return true;
+// Mirrors Frontend/lib/orderStatus.ts's isOrderDelayed — keep both in sync.
+//
+// An order is delayed if it didn't reach "completed" before its due date. That's a fact
+// about what happened, not a state the order passes through, so the mark survives the rest
+// of the order's life: a job finished two days late still reads as delayed once it's
+// completed, and again once it's paid.
+//
+//   • open (created / in_progress) — delayed once the due date is behind us
+//   • completed / paid — delayed if the completion landed after the due date
+//   • cancelled — never delayed; it was called off, not missed
+//
+// Orders that reached completed before `completed_at` existed have no completion time on
+// record. They fall through as not-delayed rather than being guessed at — which is what the
+// app showed for them before this rule anyway; `scripts/backfillCompletedAt.ts` fills them
+// in from OrderStatusHistory.
+export const FINISHED_STATUSES = ['completed', 'paid'];
+function toDateTime(value) {
+    return value instanceof Date ? DateTime.fromJSDate(value) : DateTime.fromISO(value);
+}
+/**
+ * The authoritative delay rule, computed from the order's own fields.
+ *
+ * Note this deliberately does NOT consult `is_delayed` — that field is the *output* of this
+ * function, and reading it back in would make the value self-confirming: once set, it could
+ * never be cleared, so an order whose due date is pushed out would stay marked as late
+ * forever. Callers wanting the stored answer should read `is_delayed` directly.
+ */
+export function computeIsDelayed(order) {
     if (!order.delivery_due_date)
         return false;
-    if (NON_DELAYABLE_STATUSES.includes(order.status))
+    if (order.status === 'cancelled')
         return false;
-    return DateTime.now().toUTC() > DateTime.fromISO(order.delivery_due_date);
+    const due = toDateTime(order.delivery_due_date);
+    if (FINISHED_STATUSES.includes(order.status)) {
+        if (!order.completed_at)
+            return false;
+        return toDateTime(order.completed_at) > due;
+    }
+    return DateTime.now().toUTC() > due;
 }
-// Mongo query fragment for the same definition, for filtering/counting at the DB level.
-export function delayedMatchCondition(nowISO) {
+/**
+ * Back-compat alias. Reads the stored flag when there is one, otherwise recomputes — used by
+ * the report writer, which renders orders it has already loaded.
+ */
+export function isOrderDelayed(order) {
+    return order.is_delayed ?? computeIsDelayed(order);
+}
+/**
+ * Query fragment for "delayed only" filters and counts.
+ *
+ * This used to be a three-armed $or whose last arm was
+ * `$expr: { $gt: ['$completed_at', '$delivery_due_date'] }` — a comparison between two
+ * fields of the same document, which no index can ever satisfy. Mongo had to read and
+ * evaluate every candidate order, on every Dashboard load and every filtered list. Now that
+ * `is_delayed` is maintained as a real stored value (see recomputeIsDelayed below and the
+ * nightly sweep in config/delaySweep.ts), the same question is a plain indexed equality.
+ */
+export function delayedMatchCondition() {
+    return { is_delayed: true };
+}
+/**
+ * Matches open orders that have quietly crossed their due date since anyone last wrote to
+ * them — the one transition that no request-path write can catch, because nothing happens.
+ * Drives the nightly sweep.
+ */
+export function overdueOpenOrdersFilter(now) {
     return {
-        $or: [
-            { is_delayed: true },
-            {
-                delivery_due_date: { $ne: null, $lt: nowISO },
-                status: { $nin: NON_DELAYABLE_STATUSES },
-            },
-        ],
+        is_delayed: false,
+        deleted_at: null,
+        delivery_due_date: { $ne: null, $lt: now },
+        status: { $nin: [...FINISHED_STATUSES, 'cancelled'] },
     };
 }

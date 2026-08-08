@@ -3,6 +3,7 @@ import { DateTime } from 'luxon';
 import mongoose from 'mongoose';
 import { Service, BranchService, Article, WashingMethod } from '../models.js';
 import { sessionVerification, authorizeRoles, type AuthRequest } from '../middleware/auth.js';
+import { buildSearchRegex } from '../utils/searchRegex.js';
 
 const router = Router();
 router.use(sessionVerification);
@@ -30,24 +31,30 @@ router.get('/', async (req: AuthRequest, res) => {
       query.$and = [{ $or: [{ unit_price: priceBound }, { weight_price: priceBound }] }];
     }
 
-    if (search) {
-      const escaped = (search as string).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-      const regex = { $regex: escaped, $options: 'i' };
-      query.$or = [{ name: regex }, { article_type: regex }, { washing_method: regex }];
+    // Shared helper rather than a local copy of the same escape — the duplication here is
+    // exactly what utils/searchRegex.ts exists to prevent, and this copy was missing the
+    // length cap the shared one applies.
+    const re = buildSearchRegex(search);
+    if (re) {
+      query.$or = [{ name: re }, { article_type: re }, { washing_method: re }];
     }
 
-    let services = await Service.find(query).sort({ name: 1 });
-
-    // Filter by branch if requested
+    // Branch filtering in the query rather than after it — this used to read the business's
+    // whole service catalogue and then discard the unlinked ones in JavaScript.
     if (branch_id) {
-      const links = await BranchService.find({ branch_id: new mongoose.Types.ObjectId(branch_id as string) }).select('service_id');
-      const linkedIds = new Set(links.map((l) => String(l.service_id)));
-      services = services.filter((s) => linkedIds.has(String(s._id)));
+      const links = await BranchService.find({ branch_id: new mongoose.Types.ObjectId(branch_id as string) })
+        .select('service_id')
+        .lean();
+      query._id = { $in: links.map((l) => l.service_id) };
     }
+
+    const services = await Service.find(query).sort({ name: 1 }).lean();
 
     // Attach linked branches — the card shows them as tags, and the edit drawer needs
     // them to pre-select the (mandatory) multi-select.
-    const allLinks = await BranchService.find({ service_id: { $in: services.map((s) => s._id) } }).populate('branch_id', 'name');
+    const allLinks = await BranchService.find({ service_id: { $in: services.map((s) => s._id) } })
+      .populate('branch_id', 'name')
+      .lean();
     const linksByService = new Map<string, any[]>();
     for (const link of allLinks) {
       const key = String(link.service_id);
@@ -55,7 +62,7 @@ router.get('/', async (req: AuthRequest, res) => {
       linksByService.get(key)!.push(link.branch_id);
     }
 
-    res.json(services.map((s) => ({ ...s.toObject(), branches: linksByService.get(String(s._id)) || [] })));
+    res.json(services.map((s) => ({ ...s, branches: linksByService.get(String(s._id)) || [] })));
   } catch (err: any) {
     res.status(500).json({ message: err.message });
   }
@@ -64,10 +71,10 @@ router.get('/', async (req: AuthRequest, res) => {
 // GET /api/services/:id
 router.get('/:id', async (req: AuthRequest, res) => {
   try {
-    const service = await Service.findOne({ _id: req.params.id, business_id: req.user!.businessId, deleted_at: null });
+    const service = await Service.findOne({ _id: req.params.id, business_id: req.user!.businessId, deleted_at: null }).lean();
     if (!service) return res.status(404).json({ message: 'Service not found' });
-    const links = await BranchService.find({ service_id: service._id }).populate('branch_id', 'name');
-    res.json({ ...service.toObject(), branches: links.map((l) => l.branch_id) });
+    const links = await BranchService.find({ service_id: service._id }).populate('branch_id', 'name').lean();
+    res.json({ ...service, branches: links.map((l) => l.branch_id) });
   } catch (err: any) {
     res.status(500).json({ message: err.message });
   }
@@ -120,7 +127,7 @@ router.put('/:id', authorizeRoles('owner'), async (req: AuthRequest, res) => {
     if (unit_price !== undefined) service.unit_price = Number(unit_price);
     if (weight_price !== undefined) service.weight_price = Number(weight_price);
     if (notes !== undefined) service.notes = notes;
-    service.updatedAt = DateTime.now().toUTC().toISO()!;
+    service.updatedAt = DateTime.now().toUTC().toJSDate();
     await service.save();
 
     if (branch_ids !== undefined) {
@@ -150,7 +157,7 @@ router.patch('/:id/toggle', authorizeRoles('owner', 'manager'), async (req: Auth
     }
 
     service.is_active = Boolean(is_active);
-    service.updatedAt = DateTime.now().toUTC().toISO()!;
+    service.updatedAt = DateTime.now().toUTC().toJSDate();
     await service.save();
     res.json(service);
   } catch (err: any) {
@@ -164,8 +171,8 @@ router.delete('/:id', authorizeRoles('owner'), async (req: AuthRequest, res) => 
     const service = await Service.findOne({ _id: req.params.id, business_id: req.user!.businessId, deleted_at: null });
     if (!service) return res.status(404).json({ message: 'Service not found' });
 
-    service.deleted_at = DateTime.now().toUTC().toISO()!;
-    service.updatedAt = DateTime.now().toUTC().toISO()!;
+    service.deleted_at = DateTime.now().toUTC().toJSDate();
+    service.updatedAt = DateTime.now().toUTC().toJSDate();
     await service.save();
 
     // Remove from all branch assignments
@@ -177,11 +184,32 @@ router.delete('/:id', authorizeRoles('owner'), async (req: AuthRequest, res) => 
   }
 });
 
+// ─── Master data ──────────────────────────────────────────────────────────────
+// Articles and washing methods are a small, global, effectively static reference list —
+// seeded at boot (config/seed.ts) and never written to at runtime — yet the Create Order and
+// Service drawers refetch them constantly. They now carry a private cache directive so the
+// browser stops asking, and are held in process memory so the ones that do arrive don't
+// reach Mongo at all.
+//
+// `private` rather than `public`: these sit behind sessionVerification, and a shared cache
+// must not hold a response served to an authenticated request.
+const MASTER_TTL_MS = 60 * 60 * 1000;
+const masterCache = new Map<string, { data: unknown; expires: number }>();
+
+async function serveMaster(key: string, load: () => Promise<unknown>, res: any) {
+  const hit = masterCache.get(key);
+  const data = hit && hit.expires > Date.now() ? hit.data : await load();
+  if (!hit || hit.expires <= Date.now()) {
+    masterCache.set(key, { data, expires: Date.now() + MASTER_TTL_MS });
+  }
+  res.setHeader('Cache-Control', `private, max-age=${MASTER_TTL_MS / 1000}`);
+  res.json(data);
+}
+
 // GET /api/services/master/articles
 router.get('/master/articles', async (_req, res) => {
   try {
-    const articles = await Article.find().sort({ name: 1 });
-    res.json(articles);
+    await serveMaster('articles', () => Article.find().sort({ name: 1 }).lean(), res);
   } catch (err: any) {
     res.status(500).json({ message: err.message });
   }
@@ -190,8 +218,7 @@ router.get('/master/articles', async (_req, res) => {
 // GET /api/services/master/washing-methods
 router.get('/master/washing-methods', async (_req, res) => {
   try {
-    const methods = await WashingMethod.find().sort({ name: 1 });
-    res.json(methods);
+    await serveMaster('washing-methods', () => WashingMethod.find().sort({ name: 1 }).lean(), res);
   } catch (err: any) {
     res.status(500).json({ message: err.message });
   }

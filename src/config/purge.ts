@@ -17,20 +17,23 @@ const RETENTION_DAYS = 90;
 // retention window. Runs on a daily cron (see server.ts) rather than deleting immediately,
 // so there's a recovery grace period before data is actually gone.
 export async function purgeExpiredSoftDeletes() {
-  const cutoff = DateTime.now().toUTC().minus({ days: RETENTION_DAYS }).toISO()!;
+  const cutoff = DateTime.now().toUTC().minus({ days: RETENTION_DAYS }).toJSDate();
   const expiredFilter = { deleted_at: { $ne: null, $lte: cutoff } };
 
-  const expiredOrders = await Order.find(expiredFilter).select('_id');
+  const expiredOrders = await Order.find(expiredFilter).select('_id').lean();
   const orderIds = expiredOrders.map((o) => o._id);
 
   if (orderIds.length) {
-    const images = await OrderImage.find({ order_id: { $in: orderIds } });
+    const images = await OrderImage.find({ order_id: { $in: orderIds } }).lean();
     for (const img of images) {
-      // image_url is `/uploads/orders/business_<id>/<filename>` (see orders.ts upload
-      // route) — reconstruct the on-disk path from it rather than trusting a separate join.
-      const relative = img.image_url.replace(/^\/uploads\//, '');
-      const filePath = path.join(uploadsDir, relative);
-      if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+      // image_url/thumb_url are `/uploads/orders/business_<id>/<filename>` (see orders.ts
+      // upload route) — reconstruct the on-disk path from them rather than trusting a
+      // separate join. Both are removed; the thumbnail would otherwise survive its original.
+      for (const url of [img.image_url, img.thumb_url]) {
+        if (!url) continue;
+        const filePath = path.join(uploadsDir, url.replace(/^\/uploads\//, ''));
+        if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+      }
     }
     await OrderImage.deleteMany({ order_id: { $in: orderIds } });
     await OrderService.deleteMany({ order_id: { $in: orderIds } });

@@ -11,6 +11,15 @@ router.use(sessionVerification);
 
 const DURATION_DAYS: Record<string, number> = { daily: 1, weekly: 7, monthly: 30, quarterly: 90, yearly: 365 };
 
+// Hard ceiling on rows returned in one response. A "yearly" report previously ran an
+// unbounded Order.find and then pulled every one of those orders' line items and paid-status
+// history in behind it — memory, serialisation cost and response size all scaled with however
+// many orders the business had taken that year, with nothing to stop it. The summary totals
+// are still computed across the *whole* period (they're aggregated in the database, not
+// derived from these rows), so the headline numbers stay correct even when the row list is
+// clipped; `truncated` tells the caller it happened.
+const MAX_REPORT_ROWS = 5000;
+
 // GET /api/reports/sales?duration=daily|weekly|monthly|quarterly|yearly|custom&start_date=&end_date=&branch_id=
 router.get('/sales', authorizeRoles('owner', 'manager'), async (req: AuthRequest, res) => {
   try {
@@ -44,7 +53,7 @@ router.get('/sales', authorizeRoles('owner', 'manager'), async (req: AuthRequest
     const match: any = {
       business_id: new mongoose.Types.ObjectId(req.user!.businessId!),
       deleted_at: null,
-      createdAt: { $gte: startDt.toUTC().toISO()!, $lte: endDt.toUTC().toISO()! },
+      createdAt: { $gte: startDt.toJSDate(), $lte: endDt.toJSDate() },
     };
     if (branch_id) {
       match.branch_id = new mongoose.Types.ObjectId(branch_id as string);
@@ -53,18 +62,34 @@ router.get('/sales', authorizeRoles('owner', 'manager'), async (req: AuthRequest
       match.branch_id = { $in: accessibleBranchIds.map((id) => new mongoose.Types.ObjectId(id)) };
     }
 
-    const orders = await Order.find(match)
-      .populate('branch_id', 'name branch_code')
-      .populate('created_by', 'name')
-      .sort({ createdAt: -1 });
+    // Totals are aggregated in the database over the entire period rather than summed from
+    // the rows below, so clipping the row list can't skew the headline figures.
+    const [orders, summaryAgg] = await Promise.all([
+      Order.find(match)
+        .populate('branch_id', 'name branch_code')
+        .populate('created_by', 'name')
+        .sort({ createdAt: -1 })
+        .limit(MAX_REPORT_ROWS)
+        .lean(),
+      Order.aggregate([
+        { $match: match },
+        {
+          $group: {
+            _id: null,
+            total_orders: { $sum: 1 },
+            total_revenue: { $sum: { $cond: [{ $eq: ['$status', 'paid'] }, '$total_price', 0] } },
+          },
+        },
+      ]),
+    ]);
 
     const orderIds = orders.map((o) => o._id);
 
     const [items, paidHistory] = await Promise.all([
-      OrderService.find({ order_id: { $in: orderIds } }),
+      OrderService.find({ order_id: { $in: orderIds } }).lean(),
       // "Order Marked Paid" needs the date it *entered* paid status, not just current
       // status/updatedAt — an order could theoretically be reopened after being paid.
-      OrderStatusHistory.find({ order_id: { $in: orderIds }, status: 'paid' }).sort({ changed_at: -1 }),
+      OrderStatusHistory.find({ order_id: { $in: orderIds }, status: 'paid' }).sort({ changed_at: -1 }).lean(),
     ]);
 
     const itemsByOrder = new Map<string, typeof items>();
@@ -74,10 +99,10 @@ router.get('/sales', authorizeRoles('owner', 'manager'), async (req: AuthRequest
       itemsByOrder.get(key)!.push(item);
     }
 
-    const paidDateByOrder = new Map<string, string>();
+    const paidDateByOrder = new Map<string, Date>();
     for (const h of paidHistory) {
       const key = String(h.order_id);
-      if (!paidDateByOrder.has(key)) paidDateByOrder.set(key, h.changed_at); // sorted desc — first hit is latest
+      if (!paidDateByOrder.has(key)) paidDateByOrder.set(key, h.changed_at as Date); // sorted desc — first hit is latest
     }
 
     const rows = orders.map((o, index) => {
@@ -103,11 +128,14 @@ router.get('/sales', authorizeRoles('owner', 'manager'), async (req: AuthRequest
       };
     });
 
-    const total_revenue = orders.filter((o) => o.status === 'paid').reduce((s, o) => s + o.total_price, 0);
+    const summary = summaryAgg[0] ?? { total_revenue: 0, total_orders: 0 };
 
     res.json({
       period: { start: startDt.toISODate(), end: endDt.toISODate() },
-      summary: { total_revenue, total_orders: orders.length },
+      summary: { total_revenue: summary.total_revenue, total_orders: summary.total_orders },
+      // True when the period holds more orders than one response will carry. The summary
+      // still covers the full period; only `rows` is clipped.
+      truncated: summary.total_orders > rows.length,
       rows,
     });
   } catch (err: any) {
