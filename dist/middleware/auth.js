@@ -2,6 +2,7 @@ import 'dotenv/config';
 import jwt from 'jsonwebtoken';
 import { User, Business, UserBranch } from '../models.js';
 import { getCachedUserContext, setCachedUserContext, getCachedBusinessContext, setCachedBusinessContext, } from '../utils/authCache.js';
+import { evaluateBillingLock } from '../utils/billing.js';
 if (!process.env.JWT_SECRET || !process.env.ADMIN_JWT_SECRET) {
     throw new Error('JWT_SECRET and ADMIN_JWT_SECRET environment variables must be set');
 }
@@ -52,15 +53,34 @@ async function loadUserContext(userId) {
     await setCachedUserContext(userId, ctx);
     return ctx;
 }
-async function loadBusinessStatus(businessId) {
+/**
+ * The business's gating state: the admin-portal pause flag, plus whether it has run past the
+ * 7-day grace on an unpaid billing cycle.
+ *
+ * The two are separate mechanisms with separate effects and must not be conflated. `status`
+ * is a manual switch the Apsara team throws, and it stops everyone including the owner.
+ * `billingLocked` is derived from payment records and stops staff while leaving the owner a
+ * way in to see the bill and pay it — which is the whole point of the Billing Page PRD's
+ * lockdown rules.
+ *
+ * The billing evaluation is skipped for a business that is already paused: it costs a Mongo
+ * read to compute and cannot change the outcome, since the pause rejects the request anyway.
+ */
+async function loadBusinessGate(businessId) {
     const cached = await getCachedBusinessContext(businessId);
     if (cached)
-        return cached.status;
-    const business = await Business.findById(businessId).select('status').lean();
+        return cached;
+    const business = await Business.findById(businessId)
+        .select('status createdAt plan_name monthly_fixed_cost monthly_order_limit per_order_overage_cost')
+        .lean();
     if (!business)
         return null;
-    await setCachedBusinessContext(businessId, { status: business.status });
-    return business.status;
+    const status = business.status;
+    const gate = status !== 'active'
+        ? { status, billingLocked: false, graceEndsOn: null }
+        : { status, ...(await evaluateBillingLock(business)) };
+    await setCachedBusinessContext(businessId, gate);
+    return gate;
 }
 export const sessionVerification = async (req, res, next) => {
     if (!req.session || !req.session.userId) {
@@ -96,9 +116,32 @@ export const sessionVerification = async (req, res, next) => {
             });
         }
         if (ctx.businessId) {
-            const status = await loadBusinessStatus(ctx.businessId);
-            if (status && status !== 'active') {
+            const gate = await loadBusinessGate(ctx.businessId);
+            if (gate && gate.status !== 'active') {
                 return res.status(403).json({ message: 'This account has been paused. Please contact Apsara support.' });
+            }
+            // Billing Page PRD, "Edge Cases": once a bill goes unpaid past its grace, "all the
+            // managers and workers are logged out and cannot use the application", while "the owner
+            // can login" with everything but Billing, the language selector and logout disabled.
+            //
+            // Staff are therefore cut off here, at the door. The owner is let through with a flag,
+            // and requireBillingUnlocked below is what closes the rest of the app to them — doing it
+            // that way rather than with a path test here keeps this middleware ignorant of which
+            // routes are the billing ones.
+            if (gate?.billingLocked) {
+                if (ctx.role !== 'owner') {
+                    // A distinct code from the owner's: the two need opposite handling on the client.
+                    // An owner is sent to the Billing page, which still works for them; a staff member
+                    // has nowhere to go inside the app — Billing is owner-only — so they are signed out
+                    // and told why on the login screen. Sharing one code would bounce staff into a page
+                    // that 403s them straight back out.
+                    return res.status(403).json({
+                        code: 'BILLING_LOCKED_STAFF',
+                        message: 'This account is on hold pending payment. Please ask your business owner to clear the outstanding bill.',
+                    });
+                }
+                req.billingLocked = true;
+                req.billingGraceEndsOn = gate.graceEndsOn ?? null;
             }
         }
         // Role and business come from the record we just loaded, NOT from the token. The token is
@@ -132,6 +175,29 @@ export const getAccessibleBranchIds = async (user) => {
         return null;
     const assignments = await UserBranch.find({ user_id: user.id }).select('branch_id').lean();
     return assignments.map((a) => String(a.branch_id));
+};
+/**
+ * Closes a router to an owner whose business is past its billing grace.
+ *
+ * Mounted immediately after sessionVerification on every business-facing router *except*
+ * /api/billing and /api/auth, which are exactly the two the PRD leaves working: the owner must
+ * still be able to read their bill, see the UPI details, and log out. Staff never reach this —
+ * sessionVerification already rejected them — so this only ever fires for an owner.
+ *
+ * Opt-in per router rather than a global path check because the list of what stays open is a
+ * product decision, and a path regex in one place is the kind of thing a new route silently
+ * falls outside of. A router that forgets this line stays open; a router that has it cannot be
+ * reached by accident.
+ */
+export const requireBillingUnlocked = (req, res, next) => {
+    if (req.billingLocked) {
+        return res.status(403).json({
+            code: 'BILLING_LOCKED',
+            message: 'Your plan is inactive. Please clear the outstanding payment to restore access.',
+            grace_ended_on: req.billingGraceEndsOn ?? null,
+        });
+    }
+    next();
 };
 export const authorizeRoles = (...roles) => {
     return (req, res, next) => {

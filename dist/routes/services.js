@@ -2,10 +2,12 @@ import { Router } from 'express';
 import { DateTime } from 'luxon';
 import mongoose from 'mongoose';
 import { Service, BranchService, Article, WashingMethod } from '../models.js';
-import { sessionVerification, authorizeRoles } from '../middleware/auth.js';
+import { sessionVerification, requireBillingUnlocked, authorizeRoles } from '../middleware/auth.js';
 import { buildSearchRegex } from '../utils/searchRegex.js';
 const router = Router();
 router.use(sessionVerification);
+// Billing lockdown: an owner past the 7-day grace can reach /api/billing and /api/auth only.
+router.use(requireBillingUnlocked);
 // GET /api/services
 router.get('/', async (req, res) => {
     try {

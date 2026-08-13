@@ -8,7 +8,7 @@ import mongoose from 'mongoose';
 import crypto from 'crypto';
 import sharp from 'sharp';
 import { Order, OrderService, OrderImage, OrderStatusHistory, OrderRating, OrderDailyCounter, Service, Branch, User, } from '../models.js';
-import { sessionVerification, authorizeRoles, getAccessibleBranchIds } from '../middleware/auth.js';
+import { sessionVerification, requireBillingUnlocked, authorizeRoles, getAccessibleBranchIds } from '../middleware/auth.js';
 import { buildWhatsAppMessage } from '../services/whatsapp.js';
 import { computeIsDelayed, delayedMatchCondition } from '../utils/orderDelay.js';
 import { buildSearchRegex } from '../utils/searchRegex.js';
@@ -132,6 +132,8 @@ router.post('/rate/:token', async (req, res) => {
     }
 });
 router.use(sessionVerification);
+// Billing lockdown: an owner past the 7-day grace can reach /api/billing and /api/auth only.
+router.use(requireBillingUnlocked);
 // The status progress bar only ever moves one adjacent step at a time (forward via
 // stepForward/stepBackward), cancels from created/in_progress only, and reopens a cancelled
 // order straight back to created (Order Detail Page, orders/[id]/page.tsx) — but the API

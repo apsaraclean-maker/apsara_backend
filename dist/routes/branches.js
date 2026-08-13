@@ -2,11 +2,13 @@ import { Router } from 'express';
 import { DateTime } from 'luxon';
 import mongoose from 'mongoose';
 import { Branch, BranchService, UserBranch, Service, User, Order, OrderRating } from '../models.js';
-import { sessionVerification, authorizeRoles, getAccessibleBranchIds } from '../middleware/auth.js';
+import { sessionVerification, requireBillingUnlocked, authorizeRoles, getAccessibleBranchIds } from '../middleware/auth.js';
 import { nowInBusinessTz } from '../utils/timezone.js';
 import { invalidateUserContexts } from '../utils/authCache.js';
 const router = Router();
 router.use(sessionVerification);
+// Billing lockdown: an owner past the 7-day grace can reach /api/billing and /api/auth only.
+router.use(requireBillingUnlocked);
 // Derives a branch code from the branch name: first 3 letters, uppercased. Per the PRD:
 // "In case the code already exists, then the 1st letter is skipped for creating the code" —
 // i.e. on conflict, skip the first letter and take the *next* 3 letters from the start of

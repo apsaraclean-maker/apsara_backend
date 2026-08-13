@@ -18,7 +18,7 @@ import {
   Branch,
   User,
 } from '../models.js';
-import { sessionVerification, authorizeRoles, getAccessibleBranchIds, type AuthRequest } from '../middleware/auth.js';
+import { sessionVerification, requireBillingUnlocked, authorizeRoles, getAccessibleBranchIds, type AuthRequest } from '../middleware/auth.js';
 import { buildWhatsAppMessage, type WhatsAppEvent } from '../services/whatsapp.js';
 import { computeIsDelayed, delayedMatchCondition } from '../utils/orderDelay.js';
 import { buildSearchRegex } from '../utils/searchRegex.js';
@@ -148,6 +148,8 @@ router.post('/rate/:token', async (req, res) => {
 });
 
 router.use(sessionVerification);
+// Billing lockdown: an owner past the 7-day grace can reach /api/billing and /api/auth only.
+router.use(requireBillingUnlocked);
 
 // The status progress bar only ever moves one adjacent step at a time (forward via
 // stepForward/stepBackward), cancels from created/in_progress only, and reopens a cancelled
