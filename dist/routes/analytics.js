@@ -1,8 +1,10 @@
 import { Router } from 'express';
 import { FeatureEvent } from '../models.js';
-import { sessionVerification } from '../middleware/auth.js';
+import { sessionVerification, requireBillingUnlocked } from '../middleware/auth.js';
 const router = Router();
 router.use(sessionVerification);
+// Billing lockdown: an owner past the 7-day grace can reach /api/billing and /api/auth only.
+router.use(requireBillingUnlocked);
 // POST /api/analytics/track — minimal feature-usage tracking per the PRD's "Feature
 // Tracking" requirement on every page. Called fire-and-forget from the client; kept
 // intentionally minimal, not a full analytics pipeline.

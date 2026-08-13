@@ -2,28 +2,33 @@ import { Router } from 'express';
 import bcrypt from 'bcryptjs';
 import mongoose from 'mongoose';
 import { DateTime } from 'luxon';
-import { Business, User, Payment, AdminUser } from '../models.js';
+import { Business, User, Payment, AdminUser, Branch } from '../models.js';
 import { generateAdminToken, adminAuthMiddleware } from '../middleware/auth.js';
 import { invalidateUserSessions } from '../utils/sessionControl.js';
 import { invalidateBusinessContext } from '../utils/authCache.js';
+import { encryptPin, generatePin } from '../utils/pinCrypto.js';
+import { generateBranchCode } from './branches.js';
+import { generateEmployeeId } from './staff.js';
+import { getBillingState, countBillableOrdersByCycle } from '../utils/billing.js';
+import { getCurrentCycle, getCycleByIndex, getCycleIndexAt } from '../utils/billingCycle.js';
 const router = Router();
-// Accepts the Date the schema now stores, or an ISO string from a row predating the
-// timestamp migration.
+// Cycle arithmetic moved to utils/billingCycle.ts when the owner-facing Billing page needed
+// the same windows this portal has always used. The version that lived here computed the
+// start with `today.set({ day: regDay })`, which Luxon resolves to an *invalid* DateTime for a
+// business registered on the 31st during a 30-day month — that bug is fixed in the shared
+// helper, which clamps to the month's last day instead.
 function getCurrentBillingCycle(registrationDate) {
-    const regDate = (registrationDate instanceof Date
-        ? DateTime.fromJSDate(registrationDate)
-        : DateTime.fromISO(registrationDate)).toUTC();
-    const regDay = regDate.day;
-    const today = DateTime.now().toUTC();
-    let cycleStart;
-    if (today.day >= regDay) {
-        cycleStart = today.set({ day: regDay }).startOf('day');
-    }
-    else {
-        cycleStart = today.minus({ months: 1 }).set({ day: regDay }).startOf('day');
-    }
-    const cycleEnd = cycleStart.plus({ months: 1 }).minus({ days: 1 }).endOf('day');
-    return { cycleStart: cycleStart.toISODate(), cycleEnd: cycleEnd.toISODate() };
+    return getCurrentCycle(registrationDate);
+}
+// Plan fields are read and written in several places below; kept in one shape so the list,
+// detail and update routes cannot drift apart.
+function planPayload(biz) {
+    return {
+        plan_name: biz.plan_name || 'Standard',
+        monthly_fixed_cost: Number(biz.monthly_fixed_cost) || 0,
+        monthly_order_limit: Number(biz.monthly_order_limit) || 0,
+        per_order_overage_cost: Number(biz.per_order_overage_cost) || 0,
+    };
 }
 // POST /api/admin/login
 router.post('/login', async (req, res) => {
@@ -90,6 +95,9 @@ router.get('/businesses', adminAuthMiddleware, async (_req, res) => {
                 pincode: biz.pincode,
                 state: biz.state,
                 status: biz.status,
+                gst_number: biz.gst_number || '',
+                country: biz.country || '',
+                ...planPayload(biz),
                 createdAt: biz.createdAt,
                 owner_name: owner?.name || '',
                 owner_phone: owner?.phone || '',
@@ -107,9 +115,82 @@ router.get('/businesses', adminAuthMiddleware, async (_req, res) => {
         res.status(500).json({ message: err.message });
     }
 });
+// POST /api/admin/businesses — onboard a business from the portal.
+//
+// Billing Page PRD, "Data Requirements": the Apsara team creates the business, its owner login
+// and its plan in one step, rather than the owner self-registering. Mirrors the shape of
+// /api/auth/register-business (owner user + business + a Main Branch, since nothing in the app
+// works without at least one branch) and adds the plan fields that only this portal can set.
+router.post('/businesses', adminAuthMiddleware, async (req, res) => {
+    const { name, owner_name, phone, password, gst_number, address, pincode, state, country, plan_name, monthly_fixed_cost, monthly_order_limit, per_order_overage_cost, } = req.body;
+    const missing = ['name', 'owner_name', 'phone', 'password', 'address', 'pincode', 'state', 'country']
+        .filter((k) => !String(req.body[k] ?? '').trim());
+    if (missing.length) {
+        return res.status(400).json({ message: `Missing required field(s): ${missing.join(', ')}` });
+    }
+    // A zero monthly cost is the PRD's pay-per-order arrangement, so these are checked for
+    // being present and non-negative rather than for being truthy — `!monthly_fixed_cost`
+    // would have rejected exactly the case the PRD calls out.
+    const numbers = { monthly_fixed_cost, monthly_order_limit, per_order_overage_cost };
+    for (const [key, value] of Object.entries(numbers)) {
+        const n = Number(value);
+        if (value === undefined || value === null || value === '' || !Number.isFinite(n) || n < 0) {
+            return res.status(400).json({ message: `${key} must be a number of 0 or more` });
+        }
+    }
+    try {
+        const existing = await User.findOne({ phone, deleted_at: null });
+        if (existing)
+            return res.status(400).json({ message: 'That phone number already has an account' });
+        const owner = await User.create({
+            name: owner_name,
+            phone,
+            password_hash: await bcrypt.hash(password, 10),
+            // Display-only, exactly as in self-registration: owners authenticate by password, so
+            // this PIN opens no login path — it exists because the Business Page shows every
+            // persona theirs.
+            pin_encrypted: encryptPin(generatePin()),
+            role: 'owner',
+            is_active: true,
+        });
+        const business = await Business.create({
+            name,
+            owner_id: owner._id,
+            phone,
+            gst_number: gst_number || '',
+            address,
+            pincode,
+            state,
+            country: country || 'India',
+            status: 'active',
+            plan_name: plan_name || 'Standard',
+            monthly_fixed_cost: Number(monthly_fixed_cost),
+            monthly_order_limit: Number(monthly_order_limit),
+            per_order_overage_cost: Number(per_order_overage_cost),
+        });
+        owner.business_id = business._id;
+        // Assigned only now that business_id is set — the unique (business_id, employee_id) index
+        // scopes IDs per business, and computing one against a null business puts every owner on
+        // the platform on the same key.
+        owner.employee_id = generateEmployeeId(owner_name, []);
+        await owner.save();
+        await Branch.create({
+            business_id: business._id,
+            name: 'Main Branch',
+            branch_code: generateBranchCode(name, []),
+            address_line_1: address,
+            pincode,
+            state,
+        });
+        res.status(201).json({ ...business.toObject(), owner_name: owner.name, owner_phone: owner.phone });
+    }
+    catch (err) {
+        res.status(500).json({ message: err.message });
+    }
+});
 // PUT /api/admin/businesses/:id
 router.put('/businesses/:id', adminAuthMiddleware, async (req, res) => {
-    const { name, address, phone, pincode, state, owner_name } = req.body;
+    const { name, address, phone, pincode, state, country, gst_number, owner_name, plan_name, monthly_fixed_cost, monthly_order_limit, per_order_overage_cost, } = req.body;
     try {
         const business = await Business.findById(req.params.id);
         if (!business)
@@ -124,11 +205,36 @@ router.put('/businesses/:id', adminAuthMiddleware, async (req, res) => {
             business.pincode = pincode;
         if (state !== undefined)
             business.state = state;
+        if (country !== undefined)
+            business.country = country;
+        if (gst_number !== undefined)
+            business.gst_number = gst_number;
+        if (plan_name !== undefined)
+            business.plan_name = plan_name;
+        // Same reasoning as on create: 0 is a real value here, so each is written whenever it
+        // parses as a non-negative number and skipped only when it is absent or nonsense.
+        for (const [field, value] of [
+            ['monthly_fixed_cost', monthly_fixed_cost],
+            ['monthly_order_limit', monthly_order_limit],
+            ['per_order_overage_cost', per_order_overage_cost],
+        ]) {
+            if (value === undefined || value === null || value === '')
+                continue;
+            const n = Number(value);
+            if (!Number.isFinite(n) || n < 0) {
+                return res.status(400).json({ message: `${field} must be a number of 0 or more` });
+            }
+            business[field] = n;
+        }
         business.updatedAt = DateTime.now().toUTC().toJSDate();
         await business.save();
         if (owner_name) {
             await User.findByIdAndUpdate(business.owner_id, { name: owner_name, updatedAt: DateTime.now().toUTC().toJSDate() });
         }
+        // Changing the plan changes what every unpaid cycle costs, and a cycle whose bill drops to
+        // zero stops being a lock reason — so the cached lock verdict cannot be allowed to outlive
+        // the edit.
+        await invalidateBusinessContext(business._id);
         res.json(business);
     }
     catch (err) {
@@ -205,11 +311,53 @@ router.get('/businesses/:id/payments', adminAuthMiddleware, async (req, res) => 
             .sort({ cycle_start_date: -1 })
             .lean();
         const { cycleStart, cycleEnd } = getCurrentBillingCycle(business.createdAt);
-        const currentCycleHasPayment = payments.some((p) => p.cycle_start_date === cycleStart);
+        const currentCycleHasPayment = payments.some((p) => p.cycle_start_date === cycleStart && (p.status ?? 'paid') === 'paid');
+        // What the business actually owes right now, so whoever is recording a payment can see the
+        // figure they should be collecting instead of working it out from the plan by hand.
+        const state = await getBillingState(business);
+        // Orders per settled cycle, for the same reason the owner-facing table shows them: an
+        // amount is hard to sanity-check without the volume it was billed on.
+        const anchored = [];
+        const indices = new Set();
+        for (const p of payments) {
+            const index = getCycleIndexAt(business.createdAt, DateTime.fromISO(p.cycle_start_date, { zone: 'utc' }));
+            const cycle = getCycleByIndex(business.createdAt, index);
+            if (cycle.cycleStart === p.cycle_start_date)
+                indices.add(index);
+        }
+        if (indices.size) {
+            const lo = Math.min(...indices);
+            const hi = Math.max(...indices);
+            for (let i = lo; i <= hi; i++)
+                anchored.push(getCycleByIndex(business.createdAt, i));
+        }
+        const orderCounts = await countBillableOrdersByCycle(business._id, anchored);
         res.json({
-            payments,
+            payments: payments.map((p) => ({ ...p, status: p.status ?? 'paid', orders: orderCounts.get(p.cycle_start_date) ?? 0 })),
             current_cycle: { cycle_start: cycleStart, cycle_end: cycleEnd },
             payment_label: business.status === 'active' ? (currentCycleHasPayment ? 'Paid' : 'Delayed') : 'N/A',
+            plan: planPayload(business),
+            billing: {
+                amount_due: state.amountDue,
+                due_date: state.dueDate,
+                current_cycle_bill: state.currentBill.monthlyBill,
+                current_cycle_orders: state.currentBill.orders,
+                locked: state.locked,
+                grace_ends_on: state.graceEndsOn,
+                outstanding: state.outstanding.map((c) => ({
+                    cycle_start: c.cycleStart,
+                    cycle_end: c.cycleEnd,
+                    orders: c.bill.orders,
+                    // Billed vs already-settled vs still-owed are shown separately, because the gap
+                    // between the first two is the whole point: it is the overage that accrued after
+                    // the fixed charge was recorded.
+                    billed: c.bill.monthlyBill,
+                    paid: c.paid,
+                    amount: c.amountDue,
+                    due_date: c.dueDate,
+                    overdue: c.overdue,
+                })),
+            },
         });
     }
     catch (err) {
@@ -218,14 +366,27 @@ router.get('/businesses/:id/payments', adminAuthMiddleware, async (req, res) => 
 });
 // POST /api/admin/businesses/:id/payments
 router.post('/businesses/:id/payments', adminAuthMiddleware, async (req, res) => {
-    const { amount, payment_date, payment_mode, reference_id, bank_name, notes, cycle_start_date, cycle_end_date } = req.body;
-    if (!amount || !payment_date || !payment_mode || !cycle_start_date || !cycle_end_date) {
+    const { amount, payment_date, payment_mode, reference_id, bank_name, notes, cycle_start_date, cycle_end_date, status } = req.body;
+    // `amount` is checked for presence rather than truthiness: the PRD explicitly allows 0 —
+    // "in case no monthly fixed cost for initial setup" — and `!amount` rejected exactly that.
+    if (amount === undefined || amount === null || amount === '' || !payment_date || !payment_mode || !cycle_start_date || !cycle_end_date) {
         return res.status(400).json({ message: 'amount, payment_date, payment_mode, cycle_start_date, cycle_end_date required' });
     }
+    if (!Number.isFinite(Number(amount)) || Number(amount) < 0) {
+        return res.status(400).json({ message: 'amount must be a number of 0 or more' });
+    }
+    if (status && !['paid', 'failed', 'pending'].includes(status)) {
+        return res.status(400).json({ message: 'status must be paid, failed or pending' });
+    }
     try {
-        const existing = await Payment.findOne({ business_id: req.params.id, cycle_start_date });
-        if (existing)
-            return res.status(400).json({ message: 'Payment already exists for this billing cycle' });
+        // A cycle may legitimately take more than one payment, so this no longer rejects a second
+        // one. A cycle's cost is not known when its first payment is taken — the fixed charge is
+        // recorded up front and overage accrues afterwards — and settlement is now judged by the
+        // total paid against the bill (utils/billing.ts), not by a row's existence. Refusing the
+        // top-up left the shortfall permanently uncollectable.
+        //
+        // The duplicate-entry guard that block also provided is not lost: the cycle's existing
+        // payments are listed directly above this form in the portal.
         const payment = await Payment.create({
             business_id: req.params.id,
             amount: Number(amount),
@@ -234,10 +395,16 @@ router.post('/businesses/:id/payments', adminAuthMiddleware, async (req, res) =>
             reference_id: reference_id || '',
             bank_name: bank_name || '',
             notes: notes || '',
+            status: status || 'paid',
             cycle_start_date,
             cycle_end_date,
             created_by: req.user?.id,
         });
+        // Recording the payment is what lifts the lockdown, and the lock verdict is cached on the
+        // request path. Without this eviction a business would stay locked out for up to the
+        // cache's 60-second TTL after the team had already marked them paid — which reads, to the
+        // owner watching the page, as the payment not having worked.
+        await invalidateBusinessContext(req.params.id);
         res.status(201).json(payment);
     }
     catch (err) {
@@ -246,11 +413,16 @@ router.post('/businesses/:id/payments', adminAuthMiddleware, async (req, res) =>
 });
 // PUT /api/admin/payments/:id
 router.put('/payments/:id', adminAuthMiddleware, async (req, res) => {
-    const { amount, payment_date, payment_mode, reference_id, bank_name, notes, cycle_start_date, cycle_end_date } = req.body;
+    const { amount, payment_date, payment_mode, reference_id, bank_name, notes, cycle_start_date, cycle_end_date, status } = req.body;
+    if (status && !['paid', 'failed', 'pending'].includes(status)) {
+        return res.status(400).json({ message: 'status must be paid, failed or pending' });
+    }
     try {
         const payment = await Payment.findById(req.params.id);
         if (!payment)
             return res.status(404).json({ message: 'Payment not found' });
+        if (status)
+            payment.status = status;
         if (amount !== undefined)
             payment.amount = Number(amount);
         if (payment_date)
@@ -269,6 +441,10 @@ router.put('/payments/:id', adminAuthMiddleware, async (req, res) => {
             payment.cycle_end_date = cycle_end_date;
         payment.updatedAt = DateTime.now().toUTC().toJSDate();
         await payment.save();
+        // Editing a payment can settle or un-settle a cycle just as surely as creating one —
+        // flipping its status to 'failed', or moving it onto a different cycle, both change the
+        // lock verdict. Same eviction as the create path.
+        await invalidateBusinessContext(payment.business_id);
         res.json(payment);
     }
     catch (err) {

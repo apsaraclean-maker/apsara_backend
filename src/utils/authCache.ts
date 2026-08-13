@@ -54,6 +54,19 @@ export interface CachedUserContext {
 
 export interface CachedBusinessContext {
   status: string;
+  /**
+   * Whether the business is past the 7-day grace on an unpaid cycle (see utils/billing.ts).
+   * Cached alongside the status because it is decided on the same hot path and costs a Mongo
+   * read of its own to compute.
+   *
+   * Optional so an entry written before this field existed — one already in Redis at deploy —
+   * reads back as "not locked" rather than as garbage. That errs open, which is the right
+   * direction for a 60-second window: the worst case is a business staying usable one minute
+   * longer than it should, not a paying business being locked out.
+   */
+  billingLocked?: boolean;
+  /** Day the grace expires, for the message shown to a locked-out staff member. */
+  graceEndsOn?: string | null;
 }
 
 async function readJson<T>(key: string): Promise<T | null> {

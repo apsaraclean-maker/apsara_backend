@@ -1,11 +1,13 @@
 import { Router } from 'express';
 import mongoose from 'mongoose';
 import { Order, OrderService, OrderStatusHistory } from '../models.js';
-import { sessionVerification, authorizeRoles, getAccessibleBranchIds } from '../middleware/auth.js';
+import { sessionVerification, requireBillingUnlocked, authorizeRoles, getAccessibleBranchIds } from '../middleware/auth.js';
 import { isOrderDelayed } from '../utils/orderDelay.js';
 import { nowInBusinessTz, parseDateInBusinessTz } from '../utils/timezone.js';
 const router = Router();
 router.use(sessionVerification);
+// Billing lockdown: an owner past the 7-day grace can reach /api/billing and /api/auth only.
+router.use(requireBillingUnlocked);
 const DURATION_DAYS = { daily: 1, weekly: 7, monthly: 30, quarterly: 90, yearly: 365 };
 // Hard ceiling on rows returned in one response. A "yearly" report previously ran an
 // unbounded Order.find and then pulled every one of those orders' line items and paid-status

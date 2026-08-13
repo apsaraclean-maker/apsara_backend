@@ -2,12 +2,14 @@ import { Router } from 'express';
 import { DateTime } from 'luxon';
 import mongoose from 'mongoose';
 import { Order, OrderRating, OrderStatusHistory, Branch, UserBranch } from '../models.js';
-import { sessionVerification, authorizeRoles, getAccessibleBranchIds, type AuthRequest } from '../middleware/auth.js';
+import { sessionVerification, requireBillingUnlocked, authorizeRoles, getAccessibleBranchIds, type AuthRequest } from '../middleware/auth.js';
 import { delayedMatchCondition } from '../utils/orderDelay.js';
 import { nowInBusinessTz, parseDateInBusinessTz, BUSINESS_TZ_DATE_STRING } from '../utils/timezone.js';
 
 const router = Router();
 router.use(sessionVerification);
+// Billing lockdown: an owner past the 7-day grace can reach /api/billing and /api/auth only.
+router.use(requireBillingUnlocked);
 
 // Builds the business/deleted_at/branch_id match, clipping or rejecting branch_id against
 // the caller's accessible branches (owners are unrestricted; managers/workers are limited

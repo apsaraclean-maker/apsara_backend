@@ -2,12 +2,14 @@ import { Router } from 'express';
 import { DateTime } from 'luxon';
 import mongoose from 'mongoose';
 import { Order, OrderService, OrderStatusHistory } from '../models.js';
-import { sessionVerification, authorizeRoles, getAccessibleBranchIds, type AuthRequest } from '../middleware/auth.js';
+import { sessionVerification, requireBillingUnlocked, authorizeRoles, getAccessibleBranchIds, type AuthRequest } from '../middleware/auth.js';
 import { isOrderDelayed } from '../utils/orderDelay.js';
 import { nowInBusinessTz, parseDateInBusinessTz } from '../utils/timezone.js';
 
 const router = Router();
 router.use(sessionVerification);
+// Billing lockdown: an owner past the 7-day grace can reach /api/billing and /api/auth only.
+router.use(requireBillingUnlocked);
 
 const DURATION_DAYS: Record<string, number> = { daily: 1, weekly: 7, monthly: 30, quarterly: 90, yearly: 365 };
 

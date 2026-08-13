@@ -1,8 +1,10 @@
 import { Router } from 'express';
 import axios from 'axios';
-import { sessionVerification } from '../middleware/auth.js';
+import { sessionVerification, requireBillingUnlocked } from '../middleware/auth.js';
 const router = Router();
 router.use(sessionVerification);
+// Billing lockdown: an owner past the 7-day grace can reach /api/billing and /api/auth only.
+router.use(requireBillingUnlocked);
 // Proxies Nominatim (OpenStreetMap) so we can set a proper User-Agent — Nominatim's usage
 // policy requires one identifying the application, and browsers silently strip/override any
 // User-Agent a client sets on a direct fetch, so this can't be called client-side.

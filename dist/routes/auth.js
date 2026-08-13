@@ -10,6 +10,7 @@ import { generateBranchCode } from './branches.js';
 import { generateEmployeeId } from './staff.js';
 import { deriveDeviceLabel } from '../utils/deviceLabel.js';
 import { invalidateUserSessions } from '../utils/sessionControl.js';
+import { evaluateBillingLock } from '../utils/billing.js';
 const router = Router();
 const MAX_FAILED_ATTEMPTS = 10; // wrong guesses per lockout cycle
 const LOCKOUT_MINUTES = 120; // cooldown served at 10 and at 20
@@ -104,6 +105,29 @@ async function verifyLogin(phone, password, store) {
                     },
                 },
             };
+        }
+        // Billing lockdown (Billing Page PRD, "Edge Cases"): with a bill unpaid past its grace,
+        // managers and workers "cannot login again until payment is cleared", but the owner still
+        // can — they are the only one who can do anything about it, and the Billing page is the
+        // one place the app still lets them go.
+        //
+        // Checked after the credential-independent rejections above and before the password
+        // comparison below, so a locked-out worker gets the reason rather than a generic failure,
+        // and so a wrong PIN here still can't be distinguished from a right one.
+        if (business && user.role !== 'owner' && user.role !== 'admin') {
+            const { locked } = await evaluateBillingLock(business);
+            if (locked) {
+                return {
+                    ok: false,
+                    failure: {
+                        status: 403,
+                        body: {
+                            code: 'BILLING_LOCKED',
+                            message: 'This account is on hold pending payment. Please ask your business owner to clear the outstanding bill.',
+                        },
+                    },
+                };
+            }
         }
     }
     if (await verifyCredential(user, password)) {
@@ -379,7 +403,17 @@ router.get('/me', sessionVerification, async (req, res) => {
         // so it rides along here rather than costing a separate request per page load.
         // Appended as a scalar instead of populating business_id, which callers use as an id.
         const business = user.business_id ? await Business.findById(user.business_id).select('name') : null;
-        res.json({ ...user.toObject(), business_name: business?.name || '' });
+        // billing_locked rides along for the same reason business_name does: the sidebar has to
+        // know on first paint whether to render every tab but Billing as disabled (PRD "Edge
+        // Cases"), and this is the one request every page already makes before rendering.
+        //
+        // It is a display hint, not the enforcement — requireBillingUnlocked is. A client that
+        // ignored this flag would still get a 403 from every route it tried.
+        res.json({
+            ...user.toObject(),
+            business_name: business?.name || '',
+            billing_locked: !!req.billingLocked,
+        });
     }
     catch (err) {
         res.status(500).json({ message: err.message });

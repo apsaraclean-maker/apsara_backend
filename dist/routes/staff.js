@@ -4,13 +4,15 @@ import crypto from 'crypto';
 import { DateTime } from 'luxon';
 import mongoose from 'mongoose';
 import { User, UserBranch, ArchivedUser } from '../models.js';
-import { sessionVerification, authorizeRoles } from '../middleware/auth.js';
+import { sessionVerification, requireBillingUnlocked, authorizeRoles } from '../middleware/auth.js';
 import { encryptPin, decryptPin } from '../utils/pinCrypto.js';
 import { buildSearchRegex } from '../utils/searchRegex.js';
 import { invalidateUserSessions } from '../utils/sessionControl.js';
 import { invalidateUserContext } from '../utils/authCache.js';
 const router = Router();
 router.use(sessionVerification);
+// Billing lockdown: an owner past the 7-day grace can reach /api/billing and /api/auth only.
+router.use(requireBillingUnlocked);
 const PIN_REGEX = /^\d{4,6}$/;
 const PHONE_REGEX = /^[6-9]\d{9}$/;
 // Staff (manager/worker) log in via PIN, not a password — the Add Staff Drawer has no

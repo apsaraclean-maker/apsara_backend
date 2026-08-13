@@ -22,6 +22,7 @@ import { purgeExpiredSoftDeletes } from './config/purge.js';
 import { sweepOverdueOrders } from './config/delaySweep.js';
 
 import authRoutes from './routes/auth.js';
+import billingRoutes from './routes/billing.js';
 import branchRoutes from './routes/branches.js';
 import businessRoutes from './routes/business.js';
 import dashboardRoutes from './routes/dashboard.js';
@@ -195,6 +196,8 @@ async function startServer() {
 
   // ─── Routes ─────────────────────────────────────────────────────────────────
   app.use('/api/auth', authRoutes);
+  // Stays reachable when a business is locked for non-payment — see requireBillingUnlocked.
+  app.use('/api/billing', billingRoutes);
   app.use('/api/branches', branchRoutes);
   app.use('/api/business', businessRoutes);
   app.use('/api/dashboard', dashboardRoutes);

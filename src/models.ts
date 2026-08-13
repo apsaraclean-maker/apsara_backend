@@ -44,6 +44,21 @@ const businessSchema = new mongoose.Schema({
   address: { type: String, default: '' },
   pincode: { type: String, default: '' },
   state: { type: String, default: '' },
+  country: { type: String, default: 'India' },
+  // ─── Subscription plan (Billing Page PRD, "Data Requirements") ───────────────
+  // Set by the Apsara team from the admin portal when the business is onboarded; the owner
+  // can only read them, on the Billing page. The three numbers drive one formula:
+  //
+  //   monthly bill = monthly_fixed_cost + max(0, orders - monthly_order_limit) × per_order_overage_cost
+  //
+  // A monthly_fixed_cost of 0 is meaningful rather than missing: it is how the PRD expresses
+  // a pure pay-per-order arrangement, where the whole bill comes out of the overage rate. So
+  // "no plan configured" cannot be inferred from a zero here — every business has a plan, it
+  // may simply have no fixed component.
+  plan_name: { type: String, default: 'Standard' },
+  monthly_fixed_cost: { type: Number, default: 0 },
+  monthly_order_limit: { type: Number, default: 0 },
+  per_order_overage_cost: { type: Number, default: 0 },
   createdAt: { type: Date, default: getUTCNowAsDate },
   updatedAt: { type: Date, default: getUTCNowAsDate },
 });
@@ -412,6 +427,14 @@ const paymentSchema = new mongoose.Schema({
   reference_id: { type: String, default: '' },
   bank_name: { type: String, default: '' },
   notes: { type: String, default: '' },
+  // The Billing page's payment history shows a per-row status (Figma node 1064:5927 renders
+  // "Paid" green and "Failed" red). Only 'paid' settles a cycle — a 'failed' or 'pending' row
+  // leaves the cycle outstanding and the 7-day grace clock still running, which is why the
+  // lock check filters on this rather than on the row merely existing.
+  //
+  // Defaulting to 'paid' keeps every row written before this field existed meaning what it
+  // meant then: the admin portal only ever recorded money that had actually arrived.
+  status: { type: String, enum: ['paid', 'failed', 'pending'], default: 'paid' },
   // Date-only cycle keys, matched by exact string equality against getCurrentBillingCycle()'s
   // toISODate() output — deliberately not converted to Date with the timestamps above.
   cycle_start_date: { type: String, required: true },
