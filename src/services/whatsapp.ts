@@ -31,6 +31,15 @@ interface MessageContext {
   order_url?: string;
 }
 
+/**
+ * Base URL for customer-facing links, or '' when PUBLIC_APP_URL isn't configured — in which
+ * case callers drop the link rather than emit a broken relative one. Shared so the trailing
+ * slash is stripped identically everywhere it's used.
+ */
+export function publicAppBase(): string {
+  return (process.env.PUBLIC_APP_URL || '').replace(/\/$/, '');
+}
+
 /** Matches the frontend's formatMoney (lib/format.ts) so the two never disagree on a total. */
 function formatMoney(value: number): string {
   return `₹${(Number(value) || 0).toFixed(2)}`;

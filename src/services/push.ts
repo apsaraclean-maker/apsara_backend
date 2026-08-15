@@ -5,6 +5,7 @@ import { cert, getApps, getApp, initializeApp } from 'firebase-admin/app';
 import { getMessaging, type Messaging, type SendResponse } from 'firebase-admin/messaging';
 import { DateTime } from 'luxon';
 import { Business, OrderRating, PushSubscription } from '../models.js';
+import { publicAppBase } from './whatsapp.js';
 
 /**
  * Web push to customers, over Firebase Cloud Messaging.
@@ -213,7 +214,7 @@ export async function sendOrderPush(order: OrderLike, event: PushEvent, options:
     let url = '';
     if (event === 'order_paid') {
       const rating = await OrderRating.findOne({ order_id: order._id }).select('rating_token').lean();
-      const base = (process.env.PUBLIC_APP_URL || '').replace(/\/$/, '');
+      const base = publicAppBase();
       if (rating?.rating_token && base) url = `${base}/rate/${rating.rating_token}`;
     }
 

@@ -21,7 +21,7 @@ import {
   User,
 } from '../models.js';
 import { sessionVerification, requireBillingUnlocked, authorizeRoles, getAccessibleBranchIds, type AuthRequest } from '../middleware/auth.js';
-import { buildWhatsAppMessage, type WhatsAppEvent } from '../services/whatsapp.js';
+import { buildWhatsAppMessage, publicAppBase, type WhatsAppEvent } from '../services/whatsapp.js';
 import {
   isNotifiedEvent,
   isPushConfigured,
@@ -782,7 +782,7 @@ router.post('/', authorizeRoles('owner', 'manager'), async (req: AuthRequest, re
     // opt in. The notify route replays their current status on subscribe to cover that.
     sendOrderPushInBackground(order, 'order_created');
 
-    const appBase = (process.env.PUBLIC_APP_URL || '').replace(/\/$/, '');
+    const appBase = publicAppBase();
     const whatsapp_message = buildWhatsAppMessage('order_created', {
       customer_name,
       order_number,
@@ -936,12 +936,36 @@ router.patch('/:id/status', authorizeRoles('owner', 'manager'), async (req: Auth
       sendOrderPushInBackground(order, pushEvent);
     }
 
-    // The status messages carry only the customer's name and the order id by design — the
-    // shop/branch line, total and item list belong to the created message, which is the one
-    // that introduces the order.
+    // The four *progress* messages carry only the customer's name and the order id by design.
+    // `created` is the exception, and it is reachable from here as well as from the create
+    // route — reopening a cancelled order, or stepping an in-progress one back, both land on
+    // it — so it has to be built with the same shop line, order link, total and due date it
+    // gets on creation. Without this the customer received a stripped version reading
+    // "We at your laundry have received your order" with no link, total or date.
+    //
+    // The three lookups are scoped to that one case, so the far more common forward
+    // transitions still cost nothing extra.
+    let createdContext = {};
+    if (status === 'created') {
+      const [business, branch, rating] = await Promise.all([
+        Business.findById(order.business_id).select('name').lean(),
+        Branch.findById(order.branch_id).select('name').lean(),
+        OrderRating.findOne({ order_id: order._id }).select('rating_token').lean(),
+      ]);
+      const appBase = publicAppBase();
+      createdContext = {
+        business_name: business?.name || '',
+        branch_name: branch?.name || '',
+        order_total: order.total_price,
+        due_date: order.delivery_due_date,
+        order_url: appBase && rating?.rating_token ? `${appBase}/order/${rating.rating_token}` : '',
+      };
+    }
+
     const whatsapp_message = buildWhatsAppMessage(`order_${status}` as WhatsAppEvent, {
       customer_name: order.customer_name,
       order_number: order.order_number,
+      ...createdContext,
     });
 
     res.json({ order, prev_status, whatsapp_message, whatsapp_phone: order.customer_mobile });
