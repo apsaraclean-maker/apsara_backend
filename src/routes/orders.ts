@@ -14,12 +14,22 @@ import {
   OrderStatusHistory,
   OrderRating,
   OrderDailyCounter,
+  PushSubscription,
   Service,
   Branch,
+  Business,
   User,
 } from '../models.js';
 import { sessionVerification, requireBillingUnlocked, authorizeRoles, getAccessibleBranchIds, type AuthRequest } from '../middleware/auth.js';
 import { buildWhatsAppMessage, type WhatsAppEvent } from '../services/whatsapp.js';
+import {
+  isNotifiedEvent,
+  isPushConfigured,
+  normaliseMobile,
+  sendOrderPush,
+  sendOrderPushInBackground,
+  type PushEvent,
+} from '../services/push.js';
 import { computeIsDelayed, delayedMatchCondition } from '../utils/orderDelay.js';
 import { buildSearchRegex } from '../utils/searchRegex.js';
 import { nowInBusinessTz, parseDateInBusinessTz } from '../utils/timezone.js';
@@ -142,6 +152,158 @@ router.post('/rate/:token', async (req, res) => {
     await rating.save();
 
     res.json({ message: 'Thank you for your rating!' });
+  } catch (err: any) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// ─── Public browser-notification opt-in ───────────────────────────────────────
+// Reached from the link in the order-created WhatsApp message. Public for the same reason
+// the two rating routes above are, and registered in the same block, above
+// `router.use(sessionVerification)` — the customer has no account to log into.
+//
+// These reuse `rating_token` as the link secret rather than minting a second per-order
+// token. The two links go to the same person over the same channel, so a separate secret
+// would add a column and a code path without adding a boundary. The one consequence worth
+// knowing: this link is sent at order creation, whereas the rating link is sent later by
+// hand, so a customer now holds a working invoice link from the moment their order exists.
+//
+// What the token identifies is the *customer*, not the order: the subscription it creates is
+// keyed on (business_id, customer_mobile) and covers all their future orders here. See the
+// PushSubscription comment in models.ts.
+
+/** Most devices one customer can subscribe from. Stops an unattended tab loop from growing the collection without bound. */
+const MAX_DEVICES_PER_CUSTOMER = 10;
+
+/** Order statuses map 1:1 onto push events. Returns null only for a status with no event. */
+function pushEventForStatus(status: string): PushEvent | null {
+  const event = `order_${status}`;
+  return isNotifiedEvent(event) ? event : null;
+}
+
+// GET /api/orders/notify/:token — everything the customer's order page renders: the line
+// items the WhatsApp message promises ("Click here to see full order list"), and who the
+// notification opt-in on that same page would be for.
+router.get('/notify/:token', async (req, res) => {
+  try {
+    const rating = await OrderRating.findOne({ rating_token: req.params.token }).select('order_id').lean();
+    if (!rating) return res.status(404).json({ message: 'Notification link not found or expired' });
+
+    const order = await Order.findOne({ _id: rating.order_id, deleted_at: null })
+      .populate('business_id', 'name')
+      .populate('branch_id', 'name')
+      .select('order_number status customer_name customer_mobile business_id branch_id total_price extra_charges delivery_due_date createdAt')
+      .lean();
+    if (!order) return res.status(404).json({ message: 'Notification link not found or expired' });
+
+    const items = await OrderService.find({ order_id: order._id })
+      .select('service_name_snapshot article_type_snapshot pricing_mode quantity unit_price_snapshot line_total')
+      .lean();
+
+    res.json({
+      customer_name: order.customer_name,
+      business_name: (order.business_id as any)?.name || '',
+      branch_name: (order.branch_id as any)?.name || '',
+      order_number: order.order_number,
+      status: order.status,
+      total_price: order.total_price,
+      extra_charges: order.extra_charges,
+      delivery_due_date: order.delivery_due_date,
+      created_at: order.createdAt,
+      items,
+      // The page shows an honest "not available" state rather than a permission prompt that
+      // could never lead anywhere if the server has no Firebase credentials.
+      push_available: isPushConfigured(),
+    });
+  } catch (err: any) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// POST /api/orders/notify/:token — store the device's FCM token.
+router.post('/notify/:token', async (req, res) => {
+  const { fcm_token } = req.body;
+  if (!fcm_token || typeof fcm_token !== 'string') {
+    return res.status(400).json({ message: 'fcm_token is required' });
+  }
+  try {
+    const rating = await OrderRating.findOne({ rating_token: req.params.token }).select('order_id').lean();
+    if (!rating) return res.status(404).json({ message: 'Notification link not found or expired' });
+
+    const order = await Order.findOne({ _id: rating.order_id, deleted_at: null })
+      .populate('business_id', 'name')
+      .select('order_number status customer_name customer_mobile business_id total_price')
+      .lean();
+    if (!order) return res.status(404).json({ message: 'Notification link not found or expired' });
+
+    const mobile = normaliseMobile(order.customer_mobile);
+    if (!mobile) {
+      return res.status(400).json({ message: 'This order has no mobile number, so notifications cannot be linked to you' });
+    }
+
+    // upsert, not create: re-opening the link on a device that already subscribed must
+    // refresh the existing row (and un-revoke it if they'd turned notifications off) rather
+    // than collide with the unique index on fcm_token.
+    const existing = await PushSubscription.findOne({ fcm_token });
+    if (!existing) {
+      const deviceCount = await PushSubscription.countDocuments({
+        business_id: order.business_id,
+        customer_mobile: mobile,
+        revoked_at: null,
+      });
+      if (deviceCount >= MAX_DEVICES_PER_CUSTOMER) {
+        return res.status(429).json({ message: 'Too many devices are already subscribed for this number' });
+      }
+    }
+
+    await PushSubscription.findOneAndUpdate(
+      { fcm_token },
+      {
+        fcm_token,
+        business_id: (order.business_id as any)?._id ?? order.business_id,
+        customer_mobile: mobile,
+        customer_name: order.customer_name || '',
+        revoked_at: null,
+        last_seen_at: DateTime.now().toUTC().toJSDate(),
+      },
+      { upsert: true, new: true, setDefaultsOnInsert: true }
+    );
+
+    // Confirm by actually delivering one, to this device only.
+    //
+    // This is not just a nicety: the customer's *first* order can never produce an
+    // "order created" push, because the link that subscribes them travels inside that very
+    // message — by the time they opt in, the event has passed. Replaying the order's current
+    // status closes that gap and doubles as proof the permission actually works, which is
+    // otherwise invisible until the shop next touches the order.
+    const event = pushEventForStatus(order.status);
+    let confirmation_sent = 0;
+    if (event) {
+      confirmation_sent = await sendOrderPush(order as any, event, {
+        onlyToken: fcm_token,
+        businessName: (order.business_id as any)?.name || '',
+      });
+    }
+
+    res.status(201).json({ message: 'Notifications enabled', confirmation_sent });
+  } catch (err: any) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// DELETE /api/orders/notify/:token — turn notifications back off from the same page.
+// The row is revoked rather than removed so re-subscribing from this device reuses it.
+router.delete('/notify/:token', async (req, res) => {
+  const { fcm_token } = req.body;
+  if (!fcm_token || typeof fcm_token !== 'string') {
+    return res.status(400).json({ message: 'fcm_token is required' });
+  }
+  try {
+    await PushSubscription.updateOne(
+      { fcm_token },
+      { revoked_at: DateTime.now().toUTC().toJSDate() }
+    );
+    res.json({ message: 'Notifications disabled' });
   } catch (err: any) {
     res.status(500).json({ message: err.message });
   }
@@ -511,9 +673,13 @@ router.post('/', authorizeRoles('owner', 'manager'), async (req: AuthRequest, re
   try {
     // The branch and the creating user are independent lookups — the creator's id comes off
     // the verified session, not off the branch — so they resolve together.
-    const [branch, creator] = await Promise.all([
+    // The business joins these two because the customer's WhatsApp message now names the
+    // shop and branch it came from ("We at Sparkle Wash Co., Nairobi have received your
+    // order"); it is independent of both, so it resolves alongside them rather than after.
+    const [branch, creator, business] = await Promise.all([
       Branch.findOne({ _id: branch_id, business_id: req.user!.businessId, deleted_at: null }).lean(),
       User.findById(req.user!.id).select('name employee_id').lean(),
+      Business.findById(req.user!.businessId).select('name').lean(),
     ]);
     if (!branch) return res.status(404).json({ message: 'Branch not found' });
 
@@ -593,6 +759,11 @@ router.post('/', authorizeRoles('owner', 'manager'), async (req: AuthRequest, re
       is_delayed: computeIsDelayed({ delivery_due_date: delivery_due_date || null, completed_at: null, status: 'created' }),
     });
 
+    // Generated up here rather than inline below because the WhatsApp message built at the
+    // end of this handler needs it: the same token gates both the rating page and the
+    // notification opt-in page the message links to.
+    const rating_token = crypto.randomBytes(24).toString('hex');
+
     // The three dependent writes below all key off order._id and touch different collections,
     // so nothing orders them relative to each other — they were simply awaited one after
     // another. Issued together they cost one round trip instead of three.
@@ -601,15 +772,25 @@ router.post('/', authorizeRoles('owner', 'manager'), async (req: AuthRequest, re
         ? OrderService.insertMany(orderItems.map((i) => ({ ...i, order_id: order._id })))
         : Promise.resolve(),
       // Rating token
-      OrderRating.create({ order_id: order._id, rating_token: crypto.randomBytes(24).toString('hex') }),
+      OrderRating.create({ order_id: order._id, rating_token }),
       // Initial status history
       OrderStatusHistory.create({ order_id: order._id, status: 'created', changed_by: req.user!.id }),
     ]);
 
+    // Only a *returning* customer can receive this one — a first-timer is subscribed by the
+    // very message being composed below, so the event has already passed by the time they
+    // opt in. The notify route replays their current status on subscribe to cover that.
+    sendOrderPushInBackground(order, 'order_created');
+
+    const appBase = (process.env.PUBLIC_APP_URL || '').replace(/\/$/, '');
     const whatsapp_message = buildWhatsAppMessage('order_created', {
       customer_name,
       order_number,
-      business_name: '',
+      business_name: business?.name || '',
+      branch_name: branch.name || '',
+      order_total: total_price,
+      due_date: delivery_due_date || null,
+      order_url: appBase ? `${appBase}/order/${rating_token}` : '',
     });
 
     res.status(201).json({ order, whatsapp_message, whatsapp_phone: customer_mobile });
@@ -745,10 +926,22 @@ router.patch('/:id/status', authorizeRoles('owner', 'manager'), async (req: Auth
 
     await OrderStatusHistory.create({ order_id: order._id, status, changed_by: req.user!.id });
 
+    // The automatic half of the notification pair: this reaches every device the customer
+    // opted in from, with no action from the shop, while the WhatsApp message below still
+    // has to be sent by hand. Every status notifies, cancellations included. The guard stays
+    // because `status` is a runtime string off the request body — isNotifiedEvent is what
+    // narrows it to a PushEvent.
+    const pushEvent = `order_${status}`;
+    if (isNotifiedEvent(pushEvent)) {
+      sendOrderPushInBackground(order, pushEvent);
+    }
+
+    // The status messages carry only the customer's name and the order id by design — the
+    // shop/branch line, total and item list belong to the created message, which is the one
+    // that introduces the order.
     const whatsapp_message = buildWhatsAppMessage(`order_${status}` as WhatsAppEvent, {
       customer_name: order.customer_name,
       order_number: order.order_number,
-      business_name: '',
     });
 
     res.json({ order, prev_status, whatsapp_message, whatsapp_phone: order.customer_mobile });

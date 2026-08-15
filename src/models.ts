@@ -353,6 +353,40 @@ const orderDailyCounterSchema = new mongoose.Schema({
 orderDailyCounterSchema.index({ branch_id: 1, order_date: 1 }, { unique: true });
 export const OrderDailyCounter = mongoose.model('OrderDailyCounter', orderDailyCounterSchema);
 
+// ─── PushSubscription ─────────────────────────────────────────────────────────
+// One row per browser that a customer has opted in from, so order status changes can reach
+// them as a web push instead of only as a WhatsApp message a staff member has to send by
+// hand.
+//
+// Customers have no login here — the only stable handle we hold on one is the mobile number
+// on their orders. So the subscription is keyed on (business_id, customer_mobile) rather
+// than on an order: opting in once from the link in one order's WhatsApp message covers
+// every later order that customer places at that shop. Keying it per-order would have meant
+// re-asking on every single order, and would have made an "order created" push impossible
+// to ever deliver (the link that subscribes them travels *inside* that message).
+//
+// customer_mobile is stored normalised (see normaliseMobile in services/push.ts) because the
+// same person is entered as "9876543210" on one order and "+91 98765 43210" on the next, and
+// an exact-match lookup on the raw field would treat those as two different people.
+const pushSubscriptionSchema = new mongoose.Schema({
+  business_id: { type: mongoose.Schema.Types.ObjectId, ref: 'Business', required: true },
+  customer_mobile: { type: String, required: true },
+  // Purely so the opt-in page can greet them by name; never used for matching.
+  customer_name: { type: String, default: '' },
+  // Unique because FCM issues one token per browser+origin: the same device re-subscribing
+  // must update its existing row, not accumulate duplicates that would each get their own
+  // copy of every notification.
+  fcm_token: { type: String, required: true, unique: true },
+  // Set when the customer unsubscribes, or when FCM tells us the token is dead. Rows are
+  // kept rather than deleted so a re-subscribe from the same device reuses the row.
+  revoked_at: { type: Date, default: null },
+  last_seen_at: { type: Date, default: getUTCNowAsDate },
+  createdAt: { type: Date, default: getUTCNowAsDate },
+});
+// The only read path: "who should this order's status change notify?"
+pushSubscriptionSchema.index({ business_id: 1, customer_mobile: 1, revoked_at: 1 });
+export const PushSubscription = mongoose.model('PushSubscription', pushSubscriptionSchema);
+
 // ─── FeatureEvent ─────────────────────────────────────────────────────────────
 
 const featureEventSchema = new mongoose.Schema({
