@@ -8,3 +8,10 @@ build/
 *.log
 uploads/orders/
 .claude
+
+# Firebase service-account keys. These files contain a live private key that grants full
+# admin access to the Firebase project. The backend never reads this file — it takes its
+# credentials from the FIREBASE_* env vars (see services/push.ts) — so it must never be
+# committed. Keep the downloaded JSON outside the repo, or here where git will ignore it.
+*firebase-adminsdk*.json
+serviceAccountKey.json
